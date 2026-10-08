@@ -1,0 +1,23 @@
+{
+  "nuclear_channel": "Hoechst",
+  "channels": {
+    "Hoechst": "/path/to/ImarisStitched_Hoechst.tif",
+    "LHX6": "/path/to/ImarisStitched_LHX6.tif",
+    "PV": "/path/to/ImarisStitched_PV.tif"
+  },
+  "output_dir": "/path/to/new/analysis_output",
+  "pixel_size_um": {"x": 0.312843137, "y": 0.312836345},
+  "cellprofiler": {
+    "pipeline": "CellProfiler/MGEOPVFinal.cppipe",
+    "conda_env": "cellprofiler-native",
+    "conda_executable": "conda"
+  },
+  "alignment": {"enabled": true, "extra_args": []},
+  "pairs": [["LHX6", "PV"]],
+  "thresholds": {"marker_nuclear": 0.25, "marker_marker": 0.25},
+  "filters": {
+    "intensity": {"Mean intensity": {"percentile": 0, "keep": "above"}},
+    "shape": {"Area_um2": {"percentile": 0, "keep": "above"}}
+  },
+  "reports": {"intensity": true, "shape": true, "colocalization": true}
+}
