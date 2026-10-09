@@ -1,13 +1,13 @@
 # Source-script interface and handoff reference
 
-This catalog documents the role of **every existing script** in the original repository. The automation does not alter source algorithms, percentile math, matching strategy, or segmentation settings. It routes their outputs, and adds temporary in-memory settings substitution by generating an ephemeral source copy for scripts that lack a CLI.
+This catalog documents the role of **every existing script** in the repository. The automation does not alter source algorithms, percentile math, matching strategy, or segmentation settings. It routes outputs and generates an ephemeral source copy containing only top-level `USER SETTINGS` substitutions for scripts that lack a CLI.
 
 | Script | Position | Inputs | Output and handoff | Runner behavior |
 |---|---|---|---|---|
 | `Stitching/IMSTIFF_trim_zero_padding.py` | Optional upstream | Original `.ims` | Exported field TIFFs | **Not run**: input is already stitched |
-| `Stitching/maxprojectscript.py` | Optional upstream example | Fixed-path TIFF Z-stack | Fixed-path max projection | **Not run**: runner performs same axis-0 max projection directly on the chosen stitched channel ZYX TIFF. Original file has a dangling `PY` token and hard-coded source/destination; left untouched. |
+| `Stitching/maxprojectscript.py` | Optional upstream example | Fixed-path TIFF Z-stack | Fixed-path max projection | **Not run**: the controller validates axes and performs the same axis-0 max projection directly. The example's hard-coded paths and dangling `PY` token cannot affect this workflow. |
 | `BigStitcher/fiji_latest_bigstitcher.def` | Optional upstream infrastructure | Singularity definition | BigStitcher environment | Not run; Imaris supplies stitching |
-| `CellProfiler/cellprofilerdriver.py` | Initial and post-registration segmentation | `--pipeline`, `--input`, `--output` | `CellMask.tiff`, `MyExpt_FilterObjects2.csv`, `MyExpt_FilterObjects.csv` (pipeline-dependent) | Runs via `conda run -n cellprofiler-native`; original script unchanged |
+| `CellProfiler/cellprofilerdriver.py` | Initial and final-frame segmentation | `--pipeline`, `--input`, `--output` | `CellMask.tiff`, `MyExpt_FilterObjects2.csv`, `MyExpt_FilterObjects.csv` | Runs via `conda run -n cellprofiler-native`; the initial pass is omitted when alignment is disabled |
 | `Alignment/CASTalign_two_channel_registration.py` | Registration | fixed/moving images + CellProfiler object CSVs, centroid CLI flags | `aligned_PV_max.tif`, `aligned_Hoechst_max.tif`, transform and QC | `--output` set per marker, link generic filename to true moving marker name; no modification to registration code |
 | `ExtractingROIs/extract_rois.py` | Aligned ROI reconstruction | CP label TIFF, marker object CSV, organoid object CSV | `<Marker>_ROI_pixels.csv`, verification/summary and reconstructed labels | Temporary settings replacement; source unchanged |
 | `ROIFiltering/Intensity/intensityfilter.py` | Intensity QC | aligned ROI-pixel CSV(s) + aligned fluorescence image(s) | `All_Channel_ROI_Intensity_Report.pdf`, CSV reports | All channels in one run; no filtering done here |
@@ -34,4 +34,4 @@ This catalog documents the role of **every existing script** in the original rep
 
 ## Intentional boundaries
 
-The current controller does not inspect or rewrite `.cppipe` internals, reinterpret microscope channel naming, auto-select thresholds, or infer pixel calibration. It expects original CellProfiler output filenames, and it validates only a subset of artifact invariants. Importantly, the current source scripts were built for particular datasets, not arbitrary microscopy file formats; manual inspection of first sample masks, alignment, and counts is mandatory.
+The controller validates that a `.cppipe` is text and contains the output names needed by the handoffs, but it does not rewrite pipeline modules, reinterpret microscope channel naming, auto-select thresholds, or infer pixel calibration. The source scripts were built for particular microscopy data rather than arbitrary image formats; manual inspection of first-sample masks, alignment, and counts remains mandatory.

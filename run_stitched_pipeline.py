@@ -11,13 +11,18 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import importlib.util
 import io
 import itertools
 import json
+import math
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -37,6 +42,28 @@ SHAPE_REPORTS = {
     "eccentricity": "ROIFiltering/Eccentricity/eccentricityfilter.py",
     "solidity": "ROIFiltering/Solidity/solidityfilter.py",
 }
+
+ANALYSIS_FILES = (
+    "Alignment/CASTalign_two_channel_registration.py",
+    "CellProfiler/cellprofilerdriver.py",
+    "ExtractingROIs/extract_rois.py",
+    "ROIFiltering/Intensity/intensityfilter.py",
+    "ROIFiltering/FinalFilter/filter.py",
+    *SHAPE_REPORTS.values(),
+    "Colocalization/colocalizationdapiscript1.py",
+    "Colocalization/colocalizationdapiscript2.py",
+)
+
+EXPECTED_CP_PIPELINE_SETTINGS = (
+    "Name the output objects:FilterObjects",
+    "Name the output objects:FilterObjects2",
+    "Enter single file name:CellMask",
+    "Filename prefix:MyExpt_",
+)
+
+MAIN_RUNTIME_MODULES = (
+    "h5py", "matplotlib", "numpy", "pandas", "PIL", "scipy", "skimage", "tifffile",
+)
 
 
 def path_value(value: object) -> str:
@@ -95,6 +122,129 @@ def resolve_path(value: str, base: Path) -> Path:
     return (p if p.is_absolute() else base / p).resolve()
 
 
+def validate_cellprofiler_pipeline(path: Path) -> str:
+    """Require a real text .cppipe with the outputs used by this workflow."""
+    if not path.is_file():
+        raise FileNotFoundError(f"CellProfiler pipeline missing: {path}")
+    prefix = path.read_bytes()[:8]
+    if prefix == b"\x89HDF\r\n\x1a\n":
+        raise ValueError(
+            f"{path} is an HDF5 CellProfiler project, not a text .cppipe. "
+            "Export its pipeline in CellProfiler or use the text MGEOPVFinal.cppipe supplied here."
+        )
+    try:
+        pipeline_text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"CellProfiler pipeline is not UTF-8 text: {path}") from exc
+    if not pipeline_text.startswith("CellProfiler Pipeline:"):
+        raise ValueError(f"Not a recognizable CellProfiler text pipeline: {path}")
+    missing = [token for token in EXPECTED_CP_PIPELINE_SETTINGS if token not in pipeline_text]
+    if missing:
+        raise ValueError(
+            "CellProfiler pipeline is incompatible with the automated handoff; "
+            f"missing settings for expected outputs: {missing}"
+        )
+    return pipeline_text
+
+
+def inspect_tiff(path: Path) -> dict[str, object]:
+    """Return the supported single-channel TIFF layout without loading all pixels."""
+    import tifffile
+
+    try:
+        with tifffile.TiffFile(path) as tf:
+            series = tf.series[0]
+            shape = tuple(int(v) for v in series.shape)
+            axes = str(series.axes)
+            dtype = str(series.dtype)
+    except Exception as exc:
+        raise ValueError(f"Could not read TIFF metadata from {path}: {exc}") from exc
+
+    if len(shape) == 2 and axes == "YX":
+        projection_required = False
+    elif len(shape) == 3 and axes in ("ZYX", "QYX", "IYX"):
+        projection_required = True
+    else:
+        raise ValueError(
+            f"Expected a single-channel YX image or ZYX page stack, got "
+            f"shape={shape}, axes={axes!r}: {path}"
+        )
+    return {
+        "path": str(path),
+        "shape": shape,
+        "axes": axes,
+        "dtype": dtype,
+        "yx_shape": shape[-2:],
+        "projection_required": projection_required,
+    }
+
+
+def validate_inputs(cfg: dict) -> dict[str, dict[str, object]]:
+    """Fail before creating outputs if stitched TIFFs are missing or incompatible."""
+    descriptions: dict[str, dict[str, object]] = {}
+    for name, source in cfg["_channels"].items():
+        if not source.is_file():
+            raise FileNotFoundError(f"Stitched input for {name} does not exist: {source}")
+        if source.stat().st_size == 0:
+            raise ValueError(f"Stitched input for {name} is empty: {source}")
+        descriptions[name] = inspect_tiff(source)
+    dimensions = {tuple(info["yx_shape"]) for info in descriptions.values()}
+    if len(dimensions) != 1:
+        detail = ", ".join(
+            f"{name}={tuple(info['yx_shape'])}" for name, info in descriptions.items()
+        )
+        raise ValueError(
+            "All channels must share one XY pixel canvas before registration/colocalization; "
+            + detail
+        )
+    validate_cellprofiler_pipeline(cfg["_pipeline"])
+    return descriptions
+
+
+def validate_runtime(cfg: dict) -> None:
+    """Check both Python environments before a long run creates partial results."""
+    modules = list(MAIN_RUNTIME_MODULES)
+    if cfg.get("alignment", {}).get("enabled", True):
+        modules.append("castalign")
+    missing = [name for name in modules if importlib.util.find_spec(name) is None]
+    if missing:
+        raise RuntimeError(
+            "The active analysis environment is missing Python package(s): "
+            + ", ".join(missing)
+            + ". Activate the ims-mosaic environment described in STITCHED_WORKFLOW.md."
+        )
+
+    cp = cfg.get("cellprofiler", {})
+    conda = str(cp.get("conda_executable", "conda"))
+    if shutil.which(conda) is None:
+        raise RuntimeError(f"Conda executable not found: {conda}")
+    environment = str(cp.get("conda_env", "cellprofiler-native"))
+    check = subprocess.run(
+        [conda, "run", "-n", environment, "python", "-c", "import cellprofiler"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if check.returncode:
+        raise RuntimeError(
+            f"CellProfiler environment {environment!r} is unavailable or cannot import "
+            f"CellProfiler. Conda said:\n{check.stdout.strip()}"
+        )
+
+
+def analysis_code_sha256(pipeline: Path) -> str:
+    """Fingerprint the controller, pipeline, and scientific scripts used by --resume."""
+    digest = hashlib.sha256()
+    for path in [Path(__file__).resolve(), pipeline, *(ROOT / p for p in ANALYSIS_FILES)]:
+        if not path.is_file():
+            raise FileNotFoundError(f"Required analysis file missing: {path}")
+        digest.update(str(path.relative_to(ROOT) if path.is_relative_to(ROOT) else path).encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def filters_for_pass(settings: dict, pass_name: str) -> dict:
     if pass_name not in ("intensity", "shape"):
         raise ValueError(pass_name)
@@ -110,10 +260,10 @@ def filters_for_pass(settings: dict, pass_name: str) -> dict:
     if unknown:
         raise ValueError(f"{pass_name} pass includes wrong/unknown metrics: {sorted(unknown)}")
     for name, rule in user_settings.items():
-        if set(rule) != {"percentile", "keep"}:
+        if not isinstance(rule, dict) or set(rule) != {"percentile", "keep"}:
             raise ValueError(f"{name} must define percentile and keep")
         pct = rule["percentile"]
-        if not isinstance(pct, (int, float)) or not 0 <= pct <= 100:
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not 0 <= pct <= 100:
             raise ValueError(f"Invalid percentile for {name}: {pct}")
         if rule["keep"] not in ("above", "below"):
             raise ValueError(f"Invalid keep direction for {name}")
@@ -123,44 +273,116 @@ def filters_for_pass(settings: dict, pass_name: str) -> dict:
 
 def read_config(config_file: Path) -> dict:
     raw = json.loads(config_file.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("The top level of the configuration must be a JSON object")
     nuclear = raw["nuclear_channel"]
     raw_channels = raw["channels"]
-    if not isinstance(raw_channels, dict) or not raw_channels or nuclear not in raw_channels:
+    if not isinstance(nuclear, str) or not isinstance(raw_channels, dict) or not raw_channels or nuclear not in raw_channels:
         raise ValueError("channels must contain the named nuclear_channel")
-    for name in raw_channels:
+    for name, value in raw_channels.items():
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name):
             raise ValueError(f"Use simple ASCII alphanumeric/underscore channel names: {name!r}")
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"Channel {name!r} must have a nonempty TIFF path")
     channels = {name: resolve_path(path, config_file.parent) for name, path in raw_channels.items()}
     marker_names = [name for name in channels if name != nuclear]
     pairs = raw.get("pairs", list(itertools.combinations(marker_names, 2)))
+    if not isinstance(pairs, list):
+        raise ValueError("pairs must be a JSON list")
+    normalized_pairs: list[tuple[str, str]] = []
     for pair in pairs:
-        if len(pair) != 2 or pair[0] == pair[1] or any(x not in marker_names for x in pair):
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise ValueError(f"Each pair must contain two channel names: {pair!r}")
+        if pair[0] == pair[1] or any(x not in marker_names for x in pair):
             raise ValueError(f"Pair must contain two distinct, non-nuclear channel names: {pair}")
+        normalized_pairs.append((pair[0], pair[1]))
+    if len(set(normalized_pairs)) != len(normalized_pairs):
+        raise ValueError("pairs contains a duplicate directional pair")
     thresholds = raw.get("thresholds", {})
+    if not isinstance(thresholds, dict):
+        raise ValueError("thresholds must be a JSON object")
     if marker_names and "marker_nuclear" not in thresholds:
         raise ValueError("Explicit thresholds.marker_nuclear is required")
-    if pairs and "marker_marker" not in thresholds:
+    if normalized_pairs and "marker_marker" not in thresholds:
         raise ValueError("Explicit thresholds.marker_marker is required")
+    unknown_thresholds = set(thresholds) - {"marker_nuclear", "marker_marker"}
+    if unknown_thresholds:
+        raise ValueError(f"Unknown threshold settings: {sorted(unknown_thresholds)}")
     for label, v in thresholds.items():
-        if not isinstance(v, (int, float)) or not 0 <= v <= 1:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 1:
             raise ValueError(f"{label} threshold must lie in [0, 1]")
     pixels = raw["pixel_size_um"]
-    if float(pixels["x"]) <= 0 or float(pixels["y"]) <= 0:
+    if not isinstance(pixels, dict) or set(pixels) != {"x", "y"}:
+        raise ValueError("pixel_size_um must contain exactly x and y")
+    try:
+        pixel_x = float(pixels["x"])
+        pixel_y = float(pixels["y"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Pixel sizes must be finite positive numbers") from exc
+    if (
+        isinstance(pixels["x"], bool)
+        or isinstance(pixels["y"], bool)
+        or not math.isfinite(pixel_x)
+        or not math.isfinite(pixel_y)
+        or pixel_x <= 0
+        or pixel_y <= 0
+    ):
         raise ValueError("Pixel sizes must be positive")
     filters = raw.get("filters", {})
+    if not isinstance(filters, dict):
+        raise ValueError("filters must be a JSON object")
+    unknown_filter_groups = set(filters) - {"intensity", "shape"}
+    if unknown_filter_groups:
+        raise ValueError(f"Unknown filter groups: {sorted(unknown_filter_groups)}")
     filters_for_pass(filters, "intensity")
     filters_for_pass(filters, "shape")
     cp = raw.get("cellprofiler", {})
-    pipeline = resolve_path(cp.get("pipeline", "CellProfiler/MGEOPVFinal.cppipe"), ROOT)
-    if not pipeline.exists():
-        raise FileNotFoundError(f"CellProfiler pipeline missing: {pipeline}")
+    if not isinstance(cp, dict):
+        raise ValueError("cellprofiler must be a JSON object")
+    unknown_cp = set(cp) - {"pipeline", "conda_env", "conda_executable"}
+    if unknown_cp:
+        raise ValueError(f"Unknown cellprofiler settings: {sorted(unknown_cp)}")
+    pipeline_value = cp.get("pipeline", "CellProfiler/MGEOPVFinal.cppipe")
+    if not isinstance(pipeline_value, str) or not pipeline_value.strip():
+        raise ValueError("cellprofiler.pipeline must be a nonempty path")
+    for setting in ("conda_env", "conda_executable"):
+        if setting in cp and (not isinstance(cp[setting], str) or not cp[setting].strip()):
+            raise ValueError(f"cellprofiler.{setting} must be a nonempty string")
+    pipeline = resolve_path(pipeline_value, ROOT)
+    validate_cellprofiler_pipeline(pipeline)
+    alignment = raw.get("alignment", {})
+    if not isinstance(alignment, dict) or not isinstance(alignment.get("enabled", True), bool):
+        raise ValueError("alignment must be an object with a boolean enabled setting")
+    extra_args = alignment.get("extra_args", [])
+    if not isinstance(extra_args, list) or not all(isinstance(v, str) for v in extra_args):
+        raise ValueError("alignment.extra_args must be a list of command-line strings")
+    protected_args = {
+        "--fixed-image", "--moving-image", "--fixed-csv", "--moving-csv", "--output",
+        "--pixel-size-x", "--pixel-size-y", "--fixed-x-col", "--fixed-y-col",
+        "--moving-x-col", "--moving-y-col",
+    }
+    if any(
+        value in protected_args or any(value.startswith(flag + "=") for flag in protected_args)
+        for value in extra_args
+    ):
+        raise ValueError("alignment.extra_args cannot override runner-managed file/calibration arguments")
+    reports = raw.get("reports", {})
+    if not isinstance(reports, dict) or set(reports) - {"intensity", "shape", "colocalization"}:
+        raise ValueError("reports may contain only intensity, shape, and colocalization")
+    if not all(isinstance(value, bool) for value in reports.values()):
+        raise ValueError("Every reports setting must be true or false")
+    output_value = raw.get("output_dir")
+    if not isinstance(output_value, str) or not output_value.strip():
+        raise ValueError("output_dir must be a nonempty path")
     result = dict(raw)
     result["_channels"] = channels
     result["_markers"] = marker_names
-    result["_pairs"] = pairs
+    result["_pairs"] = normalized_pairs
     result["_nuclear"] = nuclear
     result["_pipeline"] = pipeline
-    result["_output"] = resolve_path(raw["output_dir"], config_file.parent)
+    result["_output"] = resolve_path(output_value, config_file.parent)
+    if result["_output"].exists() and not result["_output"].is_dir():
+        raise ValueError(f"output_dir exists but is not a directory: {result['_output']}")
     return result
 
 
@@ -170,30 +392,50 @@ class Runner:
         self.out: Path = cfg["_output"]
         self.out.mkdir(parents=True, exist_ok=True)
         self.manifest = self.out / "run_manifest.json"
+        self.log = self.out / "run.log"
         # Include input file metadata so --resume cannot silently reuse changed inputs.
         file_info = {
             name: {"path": str(path), "size": path.stat().st_size, "mtime_ns": path.stat().st_mtime_ns}
             for name, path in cfg["_channels"].items()
         }
         digest_data = {k: v for k, v in cfg.items() if not k.startswith("_")}
-        self.digest = hashlib.sha256(json.dumps({"config": digest_data, "inputs": file_info}, sort_keys=True).encode()).hexdigest()
+        self.code_digest = analysis_code_sha256(cfg["_pipeline"])
+        fingerprint = {
+            "config": digest_data,
+            "inputs": file_info,
+            "analysis_code_sha256": self.code_digest,
+        }
+        self.digest = hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()
         if self.manifest.exists():
             old = json.loads(self.manifest.read_text())
             if not resume:
                 raise RuntimeError(f"Output already has a manifest; choose a new output_dir or --resume: {self.out}")
-            if old["config_input_sha256"] != self.digest:
-                raise RuntimeError("--resume refused: config or input file metadata changed. Use a fresh output_dir.")
+            if old.get("run_fingerprint_sha256") != self.digest:
+                raise RuntimeError(
+                    "--resume refused: configuration, input metadata, pipeline, controller, "
+                    "or analysis scripts changed. Use a fresh output_dir."
+                )
             self.completed = old["completed"]
+            self.started_at = old["started_at"]
         else:
             if resume and any(self.out.iterdir()):
                 raise RuntimeError("Cannot resume an untracked output directory")
             if any(self.out.iterdir()):
                 raise RuntimeError(f"Refusing to mix with existing untracked files: {self.out}")
             self.completed = {}
+            self.started_at = datetime.now(timezone.utc).isoformat()
             self.save()
 
     def save(self) -> None:
-        payload = {"config_input_sha256": self.digest, "completed": self.completed}
+        payload = {
+            "manifest_version": 1,
+            "started_at": self.started_at,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "run_fingerprint_sha256": self.digest,
+            "analysis_code_sha256": self.code_digest,
+            "pipeline": str(self.cfg["_pipeline"]),
+            "completed": self.completed,
+        }
         temp = self.manifest.with_suffix(".json.tmp")
         temp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         temp.replace(self.manifest)
@@ -203,7 +445,29 @@ class Runner:
             print(f"[resume] {label}", flush=True)
             return
         print(f"\n{'=' * 70}\nRUNNING {label}\n{'=' * 70}", flush=True)
-        subprocess.run(cmd, cwd=ROOT, check=True)
+        command_text = shlex.join(cmd)
+        print(command_text, flush=True)
+        with self.log.open("a", encoding="utf-8") as log_file:
+            log_file.write(
+                f"\n[{datetime.now(timezone.utc).isoformat()}] {label}\n{command_text}\n"
+            )
+            log_file.flush()
+            process = subprocess.Popen(
+                cmd,
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+                bufsize=1,
+            )
+            assert process.stdout is not None
+            for line in process.stdout:
+                print(line, end="", flush=True)
+                log_file.write(line)
+            returncode = process.wait()
+        if returncode:
+            raise subprocess.CalledProcessError(returncode, cmd)
         missing = [str(p) for p in expected if not p.is_file() or not p.stat().st_size]
         if missing:
             raise RuntimeError(f"{label} finished without required output(s): {missing}")
@@ -237,24 +501,32 @@ def ensure_projection(source: Path, destination: Path) -> Path:
     """Accept 2D channel TIFFs or project a single-channel ZYX stitched TIFF."""
     import numpy as np
     import tifffile
+    description = inspect_tiff(source)
+    if not description["projection_required"]:
+        return source
+    if destination.is_file() and destination.stat().st_size:
+        projected = inspect_tiff(destination)
+        if projected["projection_required"] or projected["yx_shape"] != description["yx_shape"]:
+            raise ValueError(f"Existing projection is incompatible with its source: {destination}")
+        return destination
     with tifffile.TiffFile(source) as tf:
         series = tf.series[0]
         shape, axes = series.shape, series.axes
-        if len(shape) == 2:
-            return source
-        if len(shape) != 3 or axes not in ("ZYX", "QYX", "IYX") :
-            raise ValueError(f"Expected one-channel YX/ZYX TIFF, got {shape}, axes={axes} in {source}")
-        if destination.is_file():
-            return destination
         destination.parent.mkdir(parents=True, exist_ok=True)
         print(f"Projecting {source.name}, Z={shape[0]} (max across axis 0)", flush=True)
         if len(tf.pages) == shape[0] and all(len(p.shape) == 2 for p in tf.pages):
-            projection = tf.pages[0].asarray()
+            projection = tf.pages[0].asarray().copy()
             for page in tf.pages[1:]:
                 np.maximum(projection, page.asarray(), out=projection)
         else:
             projection = np.max(series.asarray(), axis=0)
-        tifffile.imwrite(destination, projection, bigtiff=True, compression="zlib")
+        tifffile.imwrite(
+            destination,
+            projection,
+            bigtiff=True,
+            compression="zlib",
+            metadata={"axes": "YX"},
+        )
     return destination
 
 
@@ -273,10 +545,21 @@ def input_rows(names: list[str], csvs: dict[str, Path], images: dict[str, Path])
     return [{"name": n, "roi_csv": str(csvs[n]), "original": str(images[n])} for n in names]
 
 
+def ensure_named_alignment(registered: Path, named: Path) -> Path:
+    """Expose CASTalign's fixed output name under the actual marker name."""
+    if named == registered:
+        return registered
+    if named.is_symlink():
+        if named.resolve() == registered.resolve():
+            return named
+        named.unlink()
+    elif named.exists():
+        raise RuntimeError(f"Refusing to replace unexpected alignment output: {named}")
+    named.symlink_to(registered.name)
+    return named
+
+
 def run(cfg: dict, resume: bool) -> None:
-    for n, source in cfg["_channels"].items():
-        if not source.is_file():
-            raise FileNotFoundError(f"Stitched input for {n} does not exist: {source}")
     r = Runner(cfg, resume)
     names = list(cfg["_channels"])
     markers = cfg["_markers"]
@@ -290,13 +573,12 @@ def run(cfg: dict, resume: bool) -> None:
     for name, input_path in cfg["_channels"].items():
         images[name] = ensure_projection(input_path, r.out / "00_max_projections" / f"{name}.tif")
 
-    first_cp: dict[str, Path] = {}
-    for name in names:
-        first_cp[name] = r.out / "01_initial_segmentation" / name
-        r.cp(f"02_initial_cp_{name}", images[name], first_cp[name])
-
     aligned = {nuc: images[nuc]}
     if cfg.get("alignment", {}).get("enabled", True):
+        first_cp: dict[str, Path] = {}
+        for name in names:
+            first_cp[name] = r.out / "01_initial_segmentation" / name
+            r.cp(f"02_initial_cp_{name}", images[name], first_cp[name])
         for name in markers:
             target = r.out / "02_registration" / name
             command = [sys.executable, str(ROOT / "Alignment/CASTalign_two_channel_registration.py"),
@@ -310,9 +592,7 @@ def run(cfg: dict, resume: bool) -> None:
             registered = target / "aligned_PV_max.tif"  # Hard-coded by existing CASTalign script.
             r.execute(f"03_align_{name}", command, [registered])
             named = target / f"aligned_{name}_max.tif"
-            if name != "PV" and not named.exists():
-                named.symlink_to(registered.name)  # No second multi-GB TIFF copy.
-            aligned[name] = named
+            aligned[name] = ensure_named_alignment(registered, named)
     else:
         aligned.update({name: images[name] for name in markers})
 
@@ -406,7 +686,11 @@ def run(cfg: dict, resume: bool) -> None:
                                         cfg["thresholds"]["marker_nuclear"])
         associated_csv[marker] = directory / f"{marker}_nuclear_positive_cells.csv"
         label = f"07_export_{marker}"
-        if label not in r.completed or not associated_csv[marker].is_file():
+        if (
+            label not in r.completed
+            or not associated_csv[marker].is_file()
+            or not associated_csv[marker].stat().st_size
+        ):
             export_nuclear_positive(nuclear_h5[marker], associated_csv[marker])
             r.completed[label] = [str(associated_csv[marker])]
             r.save()
@@ -426,14 +710,41 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="Validate config and print the ordered stages without executing")
     args = ap.parse_args(argv)
     cfg = read_config(args.config.resolve())
+    descriptions = validate_inputs(cfg)
     if args.dry_run:
-        print("Stitched TIFF -> max projection (when ZYX) -> initial CP -> CASTalign -> aligned CP")
-        print(" -> ROI extraction -> intensity report/gate -> shape reports/gate -> marker/nuclear")
-        print(" -> nuclear-positive CSV export -> marker/marker -> visualization/QC")
+        print("Configuration and stitched TIFF preflight: OK")
+        for name, info in descriptions.items():
+            action = "max projection required" if info["projection_required"] else "already 2D"
+            print(
+                f"  {name}: shape={info['shape']}, axes={info['axes']}, "
+                f"dtype={info['dtype']} ({action})"
+            )
+        print("Ordered stages:")
+        print("  00  maximum projection for the inputs marked above")
+        if cfg.get("alignment", {}).get("enabled", True):
+            print("  01  initial CellProfiler segmentation for registration")
+            print("  02  CASTalign each marker to the nuclear reference")
+        print("  03  CellProfiler segmentation in the final coordinate frame")
+        print("  04  ROI reconstruction and pixel-coordinate export")
+        if cfg.get("reports", {}).get("intensity", True):
+            print("  05a intensity QC report")
+        print("  05b intensity-only filter pass")
+        if cfg.get("reports", {}).get("shape", True):
+            print("  06a shape QC reports on intensity survivors")
+        print("  06b shape-only filter pass")
+        if cfg["_markers"]:
+            print("  07  marker/nuclear matching and nuclear-positive exports")
+        if cfg["_pairs"]:
+            print("  08  requested marker/marker comparisons")
+        if cfg.get("reports", {}).get("colocalization", True) and cfg["_markers"]:
+            print("      colocalization visualizations/QC enabled")
         print(f"Nuclear: {cfg['_nuclear']}; channels: {list(cfg['_channels'])}")
         print(f"Pairs (A-inside-B direction): {cfg['_pairs']}")
+        print(f"CellProfiler pipeline: {cfg['_pipeline']}")
         print(f"Output: {cfg['_output']}")
+        print("Runtime environments are checked when execution starts (without --dry-run).")
         return 0
+    validate_runtime(cfg)
     run(cfg, resume=args.resume)
     return 0
 

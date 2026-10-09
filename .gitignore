@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+
+# Project-specific paths and scientific settings; copy from the tracked example.
+stitched_pipeline.json
