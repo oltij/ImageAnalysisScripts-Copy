@@ -1049,6 +1049,8 @@ path
 
 An `.ims` file or directory containing IMS fields.
 
+When one valid `_FNN.ims` file is supplied, all sibling fields with the same sample prefix are discovered automatically. This makes `Sample_F00.ims` a valid shorthand for its complete mosaic acquisition.
+
 ---
 
 ## `--fiji-sif`
@@ -1060,6 +1062,26 @@ Required.
 ```
 
 Must point to an existing SIF containing Fiji and BigStitcher.
+
+---
+
+## `--output-root`
+
+Optional destination root. When omitted, the historical `<input folder>_IMS_to_TIFF` location is used. The complete IMS controller supplies this option so preprocessing and downstream analyses remain under one requested output directory.
+
+---
+
+## `--channel-names`
+
+Optional channel aliases assigned by zero-based IMS channel order. Names must be unique ASCII identifiers beginning with a letter.
+
+The complete four-channel workflow uses:
+
+```bash
+--channel-names Hoechst mNeonGreen BiVe3 PV
+```
+
+This affects output filenames only; it does not reorder channel data or change pixel values. Original Imaris names and wavelength metadata are recorded separately by `run_ims_pipeline.py`.
 
 ---
 

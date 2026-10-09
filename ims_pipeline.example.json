@@ -1,0 +1,58 @@
+{
+  "ims_input": "/path/to/folder/containing/Sample_F00.ims_through_Sample_F03.ims",
+  "input_mode": "auto",
+  "output_dir": "/path/to/new/complete_analysis_output",
+  "fiji_sif": "/path/to/fiji_latest_bigstitcher.sif",
+  "channel_order": ["Hoechst", "mNeonGreen", "BiVe3", "PV"],
+  "ims_unit": "um",
+  "trim_zero_padding": true,
+  "stitching": {
+    "grid": [2, 2],
+    "overlap": 10.0,
+    "min_correlation": 0.55,
+    "basic_sample_planes": 12,
+    "intensity_downsampling": 32,
+    "intensity_max_inliers": 10000,
+    "intensity_offset_only": 0.5,
+    "intensity_unmodified": 0.5
+  },
+  "analysis": {
+    "cellprofiler": {
+      "pipeline": "CellProfiler/MGEOPVFinal.cppipe",
+      "conda_env": "cellprofiler-native",
+      "conda_executable": "conda"
+    },
+    "alignment": {
+      "enabled": true,
+      "extra_args": []
+    },
+    "pairs": [
+      ["mNeonGreen", "BiVe3"],
+      ["mNeonGreen", "PV"],
+      ["BiVe3", "PV"]
+    ],
+    "thresholds": {
+      "marker_nuclear": 0.25,
+      "marker_marker": 0.25
+    },
+    "filters": {
+      "intensity": {
+        "Mean intensity": {
+          "percentile": 0,
+          "keep": "above"
+        }
+      },
+      "shape": {
+        "Area_um2": {
+          "percentile": 0,
+          "keep": "above"
+        }
+      }
+    },
+    "reports": {
+      "intensity": true,
+      "shape": true,
+      "colocalization": true
+    }
+  }
+}
