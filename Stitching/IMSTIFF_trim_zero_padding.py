@@ -32,6 +32,22 @@ except ImportError:
 import numpy as np
 import tifffile
 
+try:
+    from Stitching.tiff_safety import (
+        atomic_tiff_copy,
+        atomic_tiff_write,
+        is_complete_tiff,
+        validate_tiff,
+    )
+except ModuleNotFoundError:
+    # Support direct execution from this directory as well as package import.
+    from tiff_safety import (  # type: ignore[no-redef]
+        atomic_tiff_copy,
+        atomic_tiff_write,
+        is_complete_tiff,
+        validate_tiff,
+    )
+
 
 # Acquisition fields use exactly two digits (F00 through F99).  The anchors
 # intentionally reject similarly named processing outputs and F0-style names.
@@ -257,16 +273,22 @@ def export_tile_stacks(
 
         for index, channel in enumerate(channels):
             destination = exported / f"F{tile.field:02d}_{names[index]}.tif"
-            if destination.exists() and not overwrite:
+            source_data = dataset[resolution][timepoints[0]][channel]["Data"]
+            expected_shape = (z_count, valid_y, valid_x)
+            if not overwrite and is_complete_tiff(
+                destination, expected_shape, source_data.dtype
+            ):
                 continue
 
             # Read only the logical image extent.  This is the key change: the
             # padded 2048x2048 storage array is never written to TIFF.
-            stack = dataset[resolution][timepoints[0]][channel]["Data"][:z_count, :valid_y, :valid_x]
+            stack = source_data[:z_count, :valid_y, :valid_x]
 
             # These intermediates are deliberately uncompressed: tifffile can
             # memory-map them during BaSiC fitting, keeping RAM use bounded.
-            tifffile.imwrite(destination, stack, imagej=True, metadata={"axes": "ZYX"})
+            atomic_tiff_write(
+                destination, stack, imagej=True, metadata={"axes": "ZYX"}
+            )
     return names
 
 
@@ -318,7 +340,11 @@ def correct_basicpy(input_files: list[Path], corrected: Path, overwrite: bool, s
         raise RuntimeError("BaSiCPy is required: pip install basicpy") from error
     corrected.mkdir(parents=True, exist_ok=True)
     destinations = [corrected / path.name for path in input_files]
-    if all(path.exists() for path in destinations) and not overwrite:
+    source_signatures = [validate_tiff(path) for path in input_files]
+    if not overwrite and all(
+        is_complete_tiff(destination, shape, np.uint16)
+        for destination, (shape, _) in zip(destinations, source_signatures)
+    ):
         return
     training: list[np.ndarray] = []
     for path in input_files:
@@ -327,14 +353,20 @@ def correct_basicpy(input_files: list[Path], corrected: Path, overwrite: bool, s
         training.extend(np.asarray(data[index], dtype=np.float32) for index in indices)
     model = BaSiC(get_darkfield=False)
     model.fit(np.stack(training))
-    for source, destination in zip(input_files, destinations):
-        if destination.exists() and not overwrite:
+    for source, destination, (source_shape, _) in zip(
+        input_files, destinations, source_signatures
+    ):
+        if not overwrite and is_complete_tiff(
+            destination, source_shape, np.uint16
+        ):
             continue
         source_data = tifffile.memmap(source)
         corrected_stack = model.transform(np.asarray(source_data, dtype=np.float32))
         info = np.iinfo(np.uint16)
         result = np.clip(np.rint(corrected_stack), info.min, info.max).astype(np.uint16)
-        tifffile.imwrite(destination, result, imagej=True, metadata={"axes": "ZYX"})
+        atomic_tiff_write(
+            destination, result, imagej=True, metadata={"axes": "ZYX"}
+        )
 
 
 def ij_quote(path: Path) -> str:
@@ -471,7 +503,7 @@ def stitch_channel(sif: Path, channel: str, corrected: Path, stitched: Path,
     job = stitched / channel_dir_name
     job.mkdir(parents=True, exist_ok=True)
     output = job / f"{channel}_stitched.tif"
-    if output.exists() and not overwrite:
+    if not overwrite and is_complete_tiff(output):
         return output
 
     # Clean up stale BigStitcher input aliases from previous runs.
@@ -552,17 +584,29 @@ def stitch_channel(sif: Path, channel: str, corrected: Path, stitched: Path,
             f"see {job / 'bigstitcher.log'}"
         )
 
-    shutil.copy2(fused_candidates[0], output)
+    atomic_tiff_copy(fused_candidates[0], output)
     return output
 
 def max_project(source: Path, destination: Path, overwrite: bool) -> None:
-    if destination.exists() and not overwrite:
+    source_shape, source_dtype = validate_tiff(source)
+    if len(source_shape) < 3:
+        raise ValueError(f"Expected stitched ZYX TIFF, got shape {source_shape}: {source}")
+    expected_shape = source_shape[-2:]
+    if not overwrite and is_complete_tiff(
+        destination, expected_shape, source_dtype
+    ):
         return
     # BigStitcher may produce compressed 32-bit float TIFF stacks here; read
     # the final fused volume directly so the intensity-adjusted values are preserved.
     image = tifffile.imread(source)
     projection = np.max(image, axis=0)
-    tifffile.imwrite(destination, projection, imagej=True, metadata={"axes": "YX"}, compression="zlib")
+    atomic_tiff_write(
+        destination,
+        projection,
+        imagej=True,
+        metadata={"axes": "YX"},
+        compression="zlib",
+    )
 
 
 def clean_previous_results(root: Path, sample_name: str) -> None:

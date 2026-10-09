@@ -11,6 +11,7 @@ import numpy as np
 import tifffile
 
 import run_ims_pipeline as ims
+from Stitching import tiff_safety
 
 
 def create_synthetic_ims(
@@ -217,6 +218,69 @@ class IMSPipelineTests(unittest.TestCase):
                 self.assertEqual(projection.shape, (5, 6))
                 self.assertTrue(np.all(projection == (index + 1) * 100 + 2))
 
+    def test_direct_stitched_export_replaces_nonempty_incomplete_tiffs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            source = tmp / "StitchedSample.ims"
+            create_synthetic_ims(source)
+            acquisition = ims.Acquisition("StitchedSample", "stitched", (source,))
+            preprocessing = tmp / "preprocessing"
+            outputs = ims.export_stitched_ims(acquisition, preprocessing, True)
+            stack_path = preprocessing / "StitchedSample/01_exported/Hoechst.tif"
+            projection_path = outputs["Hoechst"]
+
+            stack_path.write_bytes(b"nonempty interrupted stack")
+            projection_bytes = projection_path.read_bytes()
+            projection_path.write_bytes(projection_bytes[: len(projection_bytes) // 2])
+
+            ims.export_stitched_ims(acquisition, preprocessing, True)
+            self.assertEqual(tifffile.imread(stack_path).shape, (3, 5, 6))
+            projection = tifffile.imread(projection_path)
+            self.assertEqual(projection.shape, (5, 6))
+            self.assertTrue(np.all(projection == 102))
+
+    def test_atomic_tiff_failure_preserves_previous_file_and_cleans_temporary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            destination = tmp / "intermediate.tif"
+            original = np.arange(20, dtype=np.uint16).reshape(4, 5)
+            tiff_safety.atomic_tiff_write(destination, original)
+            abandoned = tmp / ".intermediate.tif.abandoned.tmp.tif"
+            abandoned.write_bytes(b"partial data from a killed process")
+
+            def interrupted_write(path, *_args, **_kwargs):
+                Path(path).write_bytes(b"partial tiff")
+                raise RuntimeError("simulated interruption")
+
+            with (
+                mock.patch.object(
+                    tiff_safety.tifffile,
+                    "imwrite",
+                    side_effect=interrupted_write,
+                ),
+                self.assertRaisesRegex(RuntimeError, "simulated interruption"),
+            ):
+                tiff_safety.atomic_tiff_write(
+                    destination, np.zeros((4, 5), dtype=np.uint16)
+                )
+
+            np.testing.assert_array_equal(tifffile.imread(destination), original)
+            self.assertFalse(abandoned.exists())
+            self.assertEqual(list(tmp.glob(".intermediate.tif.*.tmp.tif")), [])
+
+    def test_tiff_validation_rejects_truncated_pixel_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "truncated.tif"
+            tifffile.imwrite(path, np.arange(1000, dtype=np.uint16).reshape(20, 50))
+            original_size = path.stat().st_size
+            with path.open("r+b") as handle:
+                handle.truncate(original_size - 100)
+            self.assertFalse(
+                tiff_safety.is_complete_tiff(
+                    path, expected_shape=(20, 50), expected_dtype=np.uint16
+                )
+            )
+
     def test_existing_mosaic_export_accepts_canonical_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -234,6 +298,33 @@ class IMSPipelineTests(unittest.TestCase):
             self.assertEqual(calibration, (0.5, 0.6, 1.25))
             for channel in ims.CHANNEL_ORDER:
                 self.assertTrue((tmp / "exported" / f"F00_{channel}.tif").is_file())
+
+    def test_existing_mosaic_export_regenerates_invalid_nonempty_tiff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            source = tmp / "Sample_F00.ims"
+            create_synthetic_ims(source)
+            mosaic = load_mosaic_module(ims.ROOT)
+            tile = mosaic.Tile(source, 0)
+            exported = tmp / "exported"
+            mosaic.export_acquisition(
+                [tile],
+                exported,
+                overwrite=False,
+                fallback_unit="um",
+                channel_names=list(ims.CHANNEL_ORDER),
+            )
+            destination = exported / "F00_Hoechst.tif"
+            destination.write_bytes(b"nonempty interrupted export")
+
+            mosaic.export_acquisition(
+                [tile],
+                exported,
+                overwrite=False,
+                fallback_unit="um",
+                channel_names=list(ims.CHANNEL_ORDER),
+            )
+            self.assertEqual(tifffile.imread(destination).shape, (3, 5, 6))
 
     def test_generated_downstream_config_uses_ims_xy_calibration(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -263,6 +354,36 @@ class IMSPipelineTests(unittest.TestCase):
         self.assertEqual(details["source_shape_yx"], [5, 7])
         self.assertEqual(details["analysis_shape_yx"], [1, 2])
         self.assertEqual(details["cropped_trailing_pixels_yx"], [2, 1])
+
+    def test_analysis_projection_replaces_nonempty_incomplete_tiff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            acquisition = ims.Acquisition("Sample", "stitched", (tmp / "Sample.ims",))
+            source = tmp / "source.tif"
+            image = np.arange(6 * 6, dtype=np.uint16).reshape(6, 6)
+            tifffile.imwrite(source, image)
+            source_outputs = {"Hoechst": source}
+            outputs, _ = ims.prepare_analysis_projections(
+                tmp / "preprocessing",
+                acquisition,
+                source_outputs,
+                factor=2,
+                method="area_mean",
+                actual_order=("Hoechst",),
+            )
+            outputs["Hoechst"].write_bytes(b"nonempty interrupted downsample")
+
+            ims.prepare_analysis_projections(
+                tmp / "preprocessing",
+                acquisition,
+                source_outputs,
+                factor=2,
+                method="area_mean",
+                actual_order=("Hoechst",),
+            )
+            result = tifffile.imread(outputs["Hoechst"])
+            expected, _ = ims.area_mean_downsample(image, 2)
+            np.testing.assert_array_equal(result, expected)
 
     def test_invalid_analysis_downsampling_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

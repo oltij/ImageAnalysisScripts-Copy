@@ -126,6 +126,16 @@ python run_ims_pipeline.py --config ims_pipeline.json --resume
 
 Resume is refused if the configuration, IMS file size/mtime, or workflow code changed. Use a new `output_dir` after changing scientific settings or source data.
 
+TIFF intermediates are crash-safe. Python-generated TIFFs are first written to
+a temporary file in the destination directory, checked for the expected image
+shape, data type, TIFF pages, and complete pixel-data byte ranges, flushed, and
+then atomically renamed. Existing TIFFs receive the same checks before reuse;
+nonempty but incomplete or incompatible files are regenerated. BigStitcher's
+fused TIFF is also validated before it is atomically copied to the stable
+pipeline filename. Temporary TIFFs are removed after a failed write, and an
+abandoned temporary left by a forced job termination is removed automatically
+when that destination is attempted again.
+
 ## Preflight checks
 
 Before output creation, the controller verifies:

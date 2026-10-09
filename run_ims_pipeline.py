@@ -29,6 +29,7 @@ import numpy as np
 import tifffile
 
 import run_stitched_pipeline as stitched_pipeline
+from Stitching.tiff_safety import atomic_tiff_write, is_complete_tiff
 
 try:
     # Merely importing this package registers optional IMS HDF5 filters.
@@ -637,7 +638,12 @@ def source_fingerprint(
                 {"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
             )
     code_hash = hashlib.sha256()
-    for path in (Path(__file__), IMS_MOSAIC_SCRIPT, ROOT / "run_stitched_pipeline.py"):
+    for path in (
+        Path(__file__),
+        IMS_MOSAIC_SCRIPT,
+        ROOT / "Stitching/tiff_safety.py",
+        ROOT / "run_stitched_pipeline.py",
+    ):
         code_hash.update(path.read_bytes())
     payload = {
         "config": {
@@ -853,8 +859,10 @@ def prepare_analysis_projections(
         downsampled, details = area_mean_downsample(image, factor)
         if destination != source:
             destination.parent.mkdir(parents=True, exist_ok=True)
-            if not destination.is_file() or not destination.stat().st_size:
-                tifffile.imwrite(
+            if not is_complete_tiff(
+                destination, tuple(downsampled.shape), downsampled.dtype
+            ):
+                atomic_tiff_write(
                     destination,
                     downsampled,
                     bigtiff=True,
@@ -911,25 +919,28 @@ def export_stitched_ims(
         for channel_key, canonical in zip(channel_keys, actual_order):
             stack_path = exported / f"{canonical}.tif"
             projection_path = outputs[canonical]
-            if (
-                stack_path.is_file()
-                and stack_path.stat().st_size
-                and projection_path.is_file()
-                and projection_path.stat().st_size
-            ):
-                continue
             dataset = channel_root[channel_key]["Data"]
             if dataset.shape != reference.shape:
                 raise ValueError(
                     f"Channel shape mismatch in {source.name}: {dataset.shape} vs {reference.shape}"
                 )
+            stack_shape = (z_count, valid_y, valid_x)
+            projection_shape = (valid_y, valid_x)
+            stack_complete = is_complete_tiff(
+                stack_path, stack_shape, dataset.dtype
+            )
+            projection_complete = is_complete_tiff(
+                projection_path, projection_shape, dataset.dtype
+            )
+            if stack_complete and projection_complete:
+                continue
             stack = dataset[:z_count, :valid_y, :valid_x]
-            if not stack_path.is_file() or not stack_path.stat().st_size:
-                tifffile.imwrite(
+            if not stack_complete:
+                atomic_tiff_write(
                     stack_path, stack, imagej=True, metadata={"axes": "ZYX"}
                 )
-            if not projection_path.is_file() or not projection_path.stat().st_size:
-                tifffile.imwrite(
+            if not projection_complete:
+                atomic_tiff_write(
                     projection_path,
                     np.max(stack, axis=0),
                     imagej=True,
