@@ -271,9 +271,12 @@ The script creates the directory automatically if needed.
 ### `--organoid-mask`
 
 Optional path to the final-coordinate Hoechst `OrganoidMask.tiff`. When
-supplied, the driver links it beside the fluorescence input under the stable
-name expected by the generated CellProfiler pipeline. The initial
-pre-registration passes do not use this argument.
+supplied, the driver reads the mask, requires a nonempty 2-D foreground, and
+writes a temporary `uint8` binary copy with values exactly `0` and `255` under
+the stable name expected by the generated CellProfiler pipeline. This avoids
+loss of foreground when a `uint16` label mask stores its tissue as value `1`.
+The source mask is never modified. The initial pre-registration passes do not
+use this argument.
 
 ## Basic usage
 
@@ -582,8 +585,10 @@ The centroid CSV can then be used by the registration script.
 
 The automated controller first runs CellProfiler on final-frame Hoechst to
 create the reference organoid mask. It then runs every aligned marker with
-that mask as the optional second input. Marker fluorescence still drives cell
-detection; the Hoechst mask supplies the common tissue boundary.
+an 8-bit `0/255` temporary copy of that mask as the optional second input.
+Marker fluorescence still drives cell detection; the Hoechst mask supplies the
+common tissue boundary. Empty reference or exported organoid masks are treated
+as failures rather than successful containment results.
 
 Conceptually:
 

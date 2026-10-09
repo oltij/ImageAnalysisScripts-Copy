@@ -1,10 +1,58 @@
 #!/usr/bin/env python3
 
 import argparse
+import shutil
 import subprocess
 import tempfile
-import shutil
 from pathlib import Path
+
+import numpy as np
+import tifffile
+
+
+def write_cellprofiler_binary_mask(source, destination):
+    """Write a nonempty 2-D mask as an 8-bit 0/255 CellProfiler input."""
+    source = Path(source)
+    destination = Path(destination)
+    try:
+        original = np.squeeze(tifffile.imread(source))
+    except Exception as error:
+        raise ValueError(f"Could not read organoid mask TIFF:\n{source}") from error
+    if original.ndim != 2:
+        raise ValueError(
+            f"Organoid mask must be a 2-D TIFF; got shape {original.shape}:\n{source}"
+        )
+    if np.issubdtype(original.dtype, np.floating) and not np.all(
+        np.isfinite(original)
+    ):
+        raise ValueError(f"Organoid mask contains non-finite values:\n{source}")
+
+    binary = original > 0
+    foreground_pixels = int(np.count_nonzero(binary))
+    if foreground_pixels == 0:
+        raise ValueError(f"Organoid mask contains no foreground pixels:\n{source}")
+
+    encoded = np.where(binary, 255, 0).astype(np.uint8)
+    tifffile.imwrite(
+        destination,
+        encoded,
+        photometric="minisblack",
+        metadata={"axes": "YX"},
+    )
+
+    # Verify the exact bytes CellProfiler will read, not only the source array.
+    written = np.squeeze(tifffile.imread(destination))
+    values = set(int(value) for value in np.unique(written))
+    if (
+        written.shape != encoded.shape
+        or written.dtype != np.uint8
+        or not values.issubset({0, 255})
+        or not np.array_equal(written, encoded)
+    ):
+        raise RuntimeError(
+            f"Temporary CellProfiler mask failed 8-bit binary validation:\n{destination}"
+        )
+    return foreground_pixels
 
 
 def run_cellprofiler(pipeline_path, input_file, output_dir, organoid_mask=None):
@@ -66,7 +114,9 @@ def run_cellprofiler(pipeline_path, input_file, output_dir, organoid_mask=None):
         temporary_mask = None
         if organoid_mask is not None:
             temporary_mask = temp_dir / "__hoechst_organoid_mask__.tif"
-            temporary_mask.symlink_to(organoid_mask)
+            foreground_pixels = write_cellprofiler_binary_mask(
+                organoid_mask, temporary_mask
+            )
 
         print("\nTemporary input directory:")
         print(f"  {temp_dir}")
@@ -74,8 +124,10 @@ def run_cellprofiler(pipeline_path, input_file, output_dir, organoid_mask=None):
         print("\nLinked input image:")
         print(f"  {temporary_input}")
         if temporary_mask is not None:
-            print("\nLinked Hoechst organoid mask:")
+            print("\nPrepared Hoechst organoid mask for CellProfiler:")
             print(f"  {temporary_mask}")
+            print("  encoding: uint8, background=0, foreground=255")
+            print(f"  foreground pixels: {foreground_pixels}")
 
         # ========================================================
         # RUN CELLPROFILER
@@ -243,8 +295,9 @@ if __name__ == "__main__":
         "--organoid-mask",
         help=(
             "Optional aligned Hoechst OrganoidMask.tiff. When supplied, the "
-            "pipeline must assign __hoechst_organoid_mask__ as "
-            "HoechstOrganoidMask."
+            "driver supplies a temporary uint8 0/255 binary copy under the "
+            "name __hoechst_organoid_mask__; the pipeline must assign it as "
+            "HoechstOrganoidMask. The source mask is not modified."
         ),
     )
 
