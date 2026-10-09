@@ -257,6 +257,10 @@ def validate_shared_mask_canvas(image: Path, organoid_mask: Path) -> None:
     if image_info["projection_required"]:
         raise ValueError(f"Shared-mask fluorescence must already be 2-D: {image}")
     mask = read_binary_mask(organoid_mask, "Hoechst organoid mask")
+    if not np.any(mask):
+        raise ValueError(
+            f"Hoechst organoid mask contains no foreground pixels: {organoid_mask}"
+        )
     if tuple(image_info["yx_shape"]) != mask.shape:
         raise ValueError(
             "Aligned marker and Hoechst organoid mask have different XY shapes: "
@@ -270,6 +274,12 @@ def verify_shared_mask_outputs(
     reference = read_binary_mask(reference_path, "Hoechst organoid mask")
     organoid = read_binary_mask(organoid_path, "marker organoid mask")
     cells = read_binary_mask(cell_path, "marker cell mask")
+    if not np.any(reference):
+        raise RuntimeError("Hoechst reference organoid mask is empty")
+    if not np.any(organoid):
+        raise RuntimeError(
+            "Marker organoid mask is empty; shared-mask segmentation did not succeed"
+        )
     if reference.shape != organoid.shape or reference.shape != cells.shape:
         raise RuntimeError(
             "Shared-mask CellProfiler outputs do not match the Hoechst mask canvas"
@@ -780,6 +790,10 @@ def run(cfg: dict, resume: bool) -> None:
     aligned_cp[nuc] = r.out / "03_aligned_segmentation" / nuc
     r.cp(f"04_aligned_cp_{nuc}", aligned[nuc], aligned_cp[nuc])
     reference_mask = aligned_cp[nuc] / "OrganoidMask.tiff"
+    if not np.any(read_binary_mask(reference_mask, "Hoechst organoid mask")):
+        raise RuntimeError(
+            f"Final Hoechst organoid mask contains no foreground pixels: {reference_mask}"
+        )
     for name in markers:
         aligned_cp[name] = r.out / "03_aligned_segmentation" / name
         r.cp(

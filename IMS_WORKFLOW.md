@@ -190,7 +190,7 @@ Before a batch analysis, inspect:
 1. `ims_metadata.json` for channel mapping and calibration;
 2. the four TIFFs in `04_max_projections/`;
 3. BigStitcher logs and fused images when using mosaic mode;
-4. the Hoechst `OrganoidMask.tiff` and its exact reuse in every marker's final segmentation;
+4. the nonempty Hoechst `OrganoidMask.tiff` and its exact reuse in every marker's final segmentation (the CellProfiler input copy is normalized to 8-bit `0/255`);
 5. `04_organoid_mask_qc/organoid_mask_qc.png` and its statistics CSV;
 6. intensity and shape QC reports;
 7. registration overlays and final cell-population counts.

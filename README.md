@@ -74,7 +74,7 @@ PUTATIVE CELL TYPES
 1. **`.ims processing → stitched image`** — export the IMS fields, trim storage padding, apply BaSiC, stitch/fuse each channel with BigStitcher, and generate max projections.
 2. **Initial segmentation of ROI per marker** — run CellProfiler on each unaligned max projection to obtain the masks/centroids needed for registration.
 3. **Align images with ROI information** — align every non-nuclear marker image independently to the same nuclear reference.
-4. **Resegment aligned images** — derive the final-coordinate tissue boundary from Hoechst, reuse it for every marker's otherwise independent CellProfiler detection, verify mask equality/containment, generate reference-based QC, and extract ROI pixel coordinates.
+4. **Resegment aligned images** — derive the final-coordinate tissue boundary from Hoechst, pass a temporary 8-bit `0/255` copy to every marker's otherwise independent CellProfiler detection, reject empty masks, verify mask equality/containment, generate reference-based QC, and extract ROI pixel coordinates.
 5. **Apply intensity visualization + filter** — inspect intensity distributions and perform the first ROI-scrubbing pass using intensity only.
 6. **Apply shape-based filter** — inspect geometry only after the intensity gate, then apply the final shape/area gate to the intensity-passing ROI population.
 7. **Apply nuclear colocalization for ROI → Cell identity** — match each marker ROI to a nuclear ROI. The persistent cross-run identity anchor is the **nuclear ObjectID**; pairwise `CellID` values remain run-local.

@@ -200,12 +200,24 @@ class StitchedPipelineTests(unittest.TestCase):
                 reference_path, organoid_path, cell_path
             )
 
+            tifffile.imwrite(organoid_path, np.zeros_like(reference))
+            with self.assertRaisesRegex(RuntimeError, "organoid mask is empty"):
+                runner.verify_shared_mask_outputs(
+                    reference_path, organoid_path, cell_path
+                )
+            tifffile.imwrite(organoid_path, reference)
+
             cells[0, 0] = 4
             tifffile.imwrite(cell_path, cells)
             with self.assertRaisesRegex(RuntimeError, "outside the Hoechst mask"):
                 runner.verify_shared_mask_outputs(
                     reference_path, organoid_path, cell_path
                 )
+
+            empty_reference = np.zeros_like(reference)
+            tifffile.imwrite(reference_path, empty_reference)
+            with self.assertRaisesRegex(ValueError, "no foreground pixels"):
+                runner.validate_shared_mask_canvas(fluorescence, reference_path)
 
     def test_binary_project_renamed_cppipe_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -344,7 +356,18 @@ class StitchedPipelineTests(unittest.TestCase):
                         out / "MyExpt_FilterObjects2.csv",
                         out / "MyExpt_FilterObjects.csv",
                     ]
-                    self._create(expected)
+                    out.mkdir(parents=True, exist_ok=True)
+                    tifffile.imwrite(
+                        expected[0],
+                        np.ones((4, 5), dtype=np.uint8),
+                        metadata={"axes": "YX"},
+                    )
+                    tifffile.imwrite(
+                        expected[1],
+                        np.ones((4, 5), dtype=np.uint8),
+                        metadata={"axes": "YX"},
+                    )
+                    self._create(expected[2:])
                     self.completed[label] = [str(path) for path in expected]
 
                 def execute(self, label, command, expected):
