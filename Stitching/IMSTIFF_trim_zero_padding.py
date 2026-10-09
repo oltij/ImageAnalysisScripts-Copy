@@ -22,11 +22,13 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import h5py
 # Registers optional HDF5 compression filters used by some IMS files.
-import hdf5plugin  # noqa: F401
+try:
+    import hdf5plugin  # noqa: F401
+except ImportError:
+    hdf5plugin = None
 import numpy as np
 import tifffile
 
@@ -129,7 +131,27 @@ def discover_groups(input_path: Path) -> dict[str, list[Tile]]:
     # Deliberately inspect only the supplied folder itself.  Recursive search
     # could accidentally combine source tiles with files in output or archive
     # subdirectories.
-    candidates = [input_path] if input_path.is_file() else input_path.glob("*.ims")
+    def directory_ims_files(directory: Path) -> list[Path]:
+        return sorted(
+            path for path in directory.iterdir()
+            if path.is_file() and path.suffix.lower() == ".ims"
+        )
+
+    if input_path.is_file():
+        selected = FIELD_RE.match(input_path.name)
+        if selected:
+            # Supplying one field is shorthand for the complete sibling set of
+            # that acquisition. This avoids a surprising one-tile grid error.
+            sample = selected.group("sample")
+            candidates = [
+                path
+                for path in directory_ims_files(input_path.parent)
+                if (match := FIELD_RE.match(path.name)) and match.group("sample") == sample
+            ]
+        else:
+            candidates = [input_path]
+    else:
+        candidates = directory_ims_files(input_path)
     groups: dict[str, list[Tile]] = defaultdict(list)
     for path in candidates:
         match = FIELD_RE.match(path.name)
@@ -183,7 +205,13 @@ def trailing_zero_padding_xy(stack: h5py.Dataset, z_count: int) -> tuple[int, in
     return valid_y, valid_x
 
 
-def export_tile_stacks(tile: Tile, exported: Path, overwrite: bool, trim_zero_padding: bool = True) -> list[str]:
+def export_tile_stacks(
+    tile: Tile,
+    exported: Path,
+    overwrite: bool,
+    trim_zero_padding: bool = True,
+    channel_names: list[str] | None = None,
+) -> list[str]:
     """Write logical native-resolution ZYX TIFFs, trimming only trailing zero padding."""
     with h5py.File(tile.path, "r") as handle:
         dataset = handle["DataSet"]
@@ -203,7 +231,13 @@ def export_tile_stacks(tile: Tile, exported: Path, overwrite: bool, trim_zero_pa
         trim_bottom = source_y - valid_y
         trim_right = source_x - valid_x
 
-        names = [channel_name(handle, index) for index in range(len(channels))]
+        metadata_names = [channel_name(handle, index) for index in range(len(channels))]
+        if channel_names is not None and len(channel_names) != len(channels):
+            raise ValueError(
+                f"{tile.path.name} has {len(channels)} channels, but "
+                f"{len(channel_names)} --channel-names were supplied"
+            )
+        names = list(channel_names) if channel_names is not None else metadata_names
         logging.info(
             "Exporting F%02d: %d channels, %d Z planes; IMS storage=%dx%d YX; "
             "logical image=%dx%d YX; trimming bottom=%d px right=%d px",
@@ -236,7 +270,14 @@ def export_tile_stacks(tile: Tile, exported: Path, overwrite: bool, trim_zero_pa
     return names
 
 
-def export_acquisition(tiles: list[Tile], exported: Path, overwrite: bool, fallback_unit: str, trim_zero_padding: bool = True) -> tuple[list[str], tuple[float, float, float]]:
+def export_acquisition(
+    tiles: list[Tile],
+    exported: Path,
+    overwrite: bool,
+    fallback_unit: str,
+    trim_zero_padding: bool = True,
+    channel_names: list[str] | None = None,
+) -> tuple[list[str], tuple[float, float, float]]:
     exported.mkdir(parents=True, exist_ok=True)
     expected: list[str] | None = None
     calibration: tuple[float, float, float] | None = None
@@ -249,7 +290,13 @@ def export_acquisition(tiles: list[Tile], exported: Path, overwrite: bool, fallb
         # mismatched acquisition calibrations.
         elif not np.allclose(calibration, tile_calibration, rtol=1e-4, atol=1e-9):
             raise ValueError(f"voxel size in {tile.path.name} differs from the first field: {tile_calibration} versus {calibration}")
-        names = export_tile_stacks(tile, exported, overwrite, trim_zero_padding=trim_zero_padding)
+        names = export_tile_stacks(
+            tile,
+            exported,
+            overwrite,
+            trim_zero_padding=trim_zero_padding,
+            channel_names=channel_names,
+        )
         if expected is None:
             expected = names
         elif names != expected:
@@ -538,6 +585,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Convert IMS mosaic fields to BaSiC-corrected, BigStitcher-registered, intensity-adjusted, fused max projections.")
     parser.add_argument("path", type=Path, help="an IMS file or a directory containing IMS files")
     parser.add_argument("--fiji-sif", type=Path, required=True, help="Singularity/Apptainer SIF containing Fiji + BigStitcher")
+    parser.add_argument("--output-root", type=Path, help="optional output root; default is <input folder>_IMS_to_TIFF beside the inputs")
+    parser.add_argument("--channel-names", nargs="+", metavar="NAME", help="optional channel names assigned by zero-based IMS channel order")
     parser.add_argument("--grid", nargs=2, type=int, metavar=("X", "Y"), default=(2, 2), help="regular grid dimensions (default: 2 2)")
     parser.add_argument("--overlap", type=float, default=10.0, help="regular-grid overlap percentage in X/Y (default: 10)")
     parser.add_argument("--min-correlation", type=float, default=0.55, help="Minimum pairwise Phase-Correlation r retained for optimization (default: 0.55)")
@@ -562,13 +611,26 @@ def main() -> int:
         raise SystemExit(f"Input does not exist: {input_path}")
     if not args.fiji_sif.is_file():
         raise SystemExit(f"Fiji SIF does not exist: {args.fiji_sif}")
+    if hdf5plugin is None:
+        raise SystemExit(
+            "hdf5plugin is unavailable; activate the ims-mosaic environment before reading IMS files"
+        )
+    if args.channel_names:
+        if len(set(args.channel_names)) != len(args.channel_names):
+            raise SystemExit("--channel-names must be unique")
+        invalid = [name for name in args.channel_names if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name)]
+        if invalid:
+            raise SystemExit(
+                "--channel-names must start with a letter and contain only letters, digits, "
+                f"and underscores; invalid: {invalid}"
+            )
     if shutil.which("singularity") is None and shutil.which("apptainer") is None:
         raise SystemExit("Neither singularity nor apptainer is available; load the Singularity module first.")
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     groups = discover_groups(input_path)
     if not groups:
         raise SystemExit("No IMS files with names ending _FNN.ims were found.")
-    root = output_root(input_path)
+    root = args.output_root.expanduser().resolve() if args.output_root else output_root(input_path)
     root.mkdir(parents=True, exist_ok=True)
     for name, tiles in groups.items():
         if len(tiles) != args.grid[0] * args.grid[1]:
@@ -581,6 +643,7 @@ def main() -> int:
         channels, ims_voxel_size = export_acquisition(
             tiles, exported, args.overwrite, args.ims_unit,
             trim_zero_padding=not args.no_trim_zero_padding,
+            channel_names=args.channel_names,
         )
         voxel_size = tuple(args.voxel_size) if args.voxel_size else ims_voxel_size
         logging.info("Using voxel size %.6g x %.6g x %.6g um (%s)", *voxel_size, "manual override" if args.voxel_size else "read from IMS")

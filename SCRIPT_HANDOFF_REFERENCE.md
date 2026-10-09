@@ -1,12 +1,12 @@
 # Source-script interface and handoff reference
 
-This catalog documents the role of **every existing script** in the repository. The automation does not alter source algorithms, percentile math, matching strategy, or segmentation settings. It routes outputs and generates an ephemeral source copy containing only top-level `USER SETTINGS` substitutions for scripts that lack a CLI.
+This catalog documents the role of **every existing script** in the repository. `run_ims_pipeline.py` covers the complete IMS entry point and hands projections/calibration to `run_stitched_pipeline.py`. The automation does not alter source algorithms, percentile math, matching strategy, or segmentation settings. It routes outputs and generates an ephemeral source copy containing only top-level `USER SETTINGS` substitutions for scripts that lack a CLI.
 
 | Script | Position | Inputs | Output and handoff | Runner behavior |
 |---|---|---|---|---|
-| `Stitching/IMSTIFF_trim_zero_padding.py` | Optional upstream | Original `.ims` | Exported field TIFFs | **Not run**: input is already stitched |
+| `Stitching/IMSTIFF_trim_zero_padding.py` | IMS mosaic preprocessing | Original `_FNN.ims` fields | Exported, BaSiC-corrected, fused and max-projected channel TIFFs | Run by `run_ims_pipeline.py` in mosaic mode with fixed channel names supplied by index; not run by the stitched-TIFF entry point |
 | `Stitching/maxprojectscript.py` | Optional upstream example | Fixed-path TIFF Z-stack | Fixed-path max projection | **Not run**: the controller validates axes and performs the same axis-0 max projection directly. The example's hard-coded paths and dangling `PY` token cannot affect this workflow. |
-| `BigStitcher/fiji_latest_bigstitcher.def` | Optional upstream infrastructure | Singularity definition | BigStitcher environment | Not run; Imaris supplies stitching |
+| `BigStitcher/fiji_latest_bigstitcher.def` | Optional upstream infrastructure | Singularity definition | BigStitcher environment | Required by `run_ims_pipeline.py` for mosaic fields; not used for an already-stitched IMS/TIFF |
 | `CellProfiler/cellprofilerdriver.py` | Initial and final-frame segmentation | `--pipeline`, `--input`, `--output` | `CellMask.tiff`, `MyExpt_FilterObjects2.csv`, `MyExpt_FilterObjects.csv` | Runs via `conda run -n cellprofiler-native`; the initial pass is omitted when alignment is disabled |
 | `Alignment/CASTalign_two_channel_registration.py` | Registration | fixed/moving images + CellProfiler object CSVs, centroid CLI flags | `aligned_PV_max.tif`, `aligned_Hoechst_max.tif`, transform and QC | `--output` set per marker, link generic filename to true moving marker name; no modification to registration code |
 | `ExtractingROIs/extract_rois.py` | Aligned ROI reconstruction | CP label TIFF, marker object CSV, organoid object CSV | `<Marker>_ROI_pixels.csv`, verification/summary and reconstructed labels | Temporary settings replacement; source unchanged |
@@ -22,6 +22,7 @@ This catalog documents the role of **every existing script** in the repository. 
 ## Source documentation retained, but see the companion orchestration documentation
 
 - `README.md`: original eight-step workflow, including upstream IMS/BigStitcher route.
+- `IMS_WORKFLOW.md`: one-command IMS channel assignment, preprocessing, metadata, and downstream handoff.
 - `Stitching/README_IMS_Mosaic_Pipeline_updated(1).md`, `Stitching/README_TIFF_max_projection.md`: optional upstream TIFF processing.
 - `BigStitcher/README_BigStitcher_DEF_exact.md`: optional container construction.
 - `CellProfiler/README_CellProfiler_headless_runner (1).md`: source-specific CP semantics and outputs.

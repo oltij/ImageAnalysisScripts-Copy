@@ -8,6 +8,19 @@ This README describes the end-to-end workflow for a tiled microscopy acquisition
 
 The document is organized around **eight pipeline steps**. Those eight steps are the authoritative processing order. The four larger phases describe what the pipeline is doing conceptually; they do **not** add extra processing steps.
 
+### Run the complete workflow from IMS files
+
+`run_ims_pipeline.py` is the complete entry point when the source data are `.ims` files. It supports both `_F00.ims`…`_F03.ims` mosaic fields and one IMS file already stitched in Imaris. It assigns channel indices 0–3 to Hoechst, mNeonGreen, BiVe3 virus, and PV; records Imaris names/wavelength metadata; reads physical calibration from the IMS; produces channel TIFF projections; and then invokes every downstream stage automatically.
+
+```bash
+cp ims_pipeline.example.json ims_pipeline.json
+# Edit IMS/output/SIF paths and scientific settings.
+python run_ims_pipeline.py --config ims_pipeline.json --dry-run
+python run_ims_pipeline.py --config ims_pipeline.json
+```
+
+Read [`IMS_WORKFLOW.md`](IMS_WORKFLOW.md) for input naming, the fixed channel mapping, mosaic versus already-stitched behavior, runtime requirements, outputs, and resume instructions.
+
 ### Start from Imaris-stitched TIFFs
 
 When stitching is already complete in Imaris, `run_stitched_pipeline.py` provides a linear entry point at Step 2 and leaves the optional IMS/BaSiC/BigStitcher route intact. It validates one single-channel TIFF per channel, runs the existing scripts in order, carries every output path into the next stage, invokes the separate CellProfiler environment automatically, logs execution, and supports provenance-checked resume.
