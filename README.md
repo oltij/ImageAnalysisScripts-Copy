@@ -10,7 +10,7 @@ The document is organized around **eight pipeline steps**. Those eight steps are
 
 ### Run the complete workflow from IMS files
 
-`run_ims_pipeline.py` is the complete entry point when the source data are `.ims` files. It supports both `_F00.ims`…`_F03.ims` mosaic fields and one IMS file already stitched in Imaris. It assigns channel indices 0–3 to Hoechst, mNeonGreen, BiVe3/BiVe4 virus, and PV; resolves the virus label separately for each organoid; records Imaris names/wavelength metadata; reads physical calibration from the IMS; produces channel TIFF projections; and then invokes every downstream stage automatically.
+`run_ims_pipeline.py` is the complete entry point when the source data are `.ims` files. It supports both `_F00.ims`…`_F03.ims` mosaic fields and one IMS file already stitched in Imaris. It assigns channel indices 0–3 to Hoechst, mNeonGreen, BiVe3/BiVe4 virus, and PV; resolves the virus label separately for each organoid; records Imaris names/wavelength metadata; retains full-resolution projections; creates consistent 3× area-mean analysis projections with automatically adjusted calibration; and then invokes every downstream stage automatically.
 
 ```bash
 cp ims_pipeline.example.json ims_pipeline.json
@@ -69,7 +69,7 @@ PUTATIVE CELL TYPES
 1. **`.ims processing → stitched image`** — export the IMS fields, trim storage padding, apply BaSiC, stitch/fuse each channel with BigStitcher, and generate max projections.
 2. **Initial segmentation of ROI per marker** — run CellProfiler on each unaligned max projection to obtain the masks/centroids needed for registration.
 3. **Align images with ROI information** — align every non-nuclear marker image independently to the same nuclear reference.
-4. **Resegment aligned images** — rerun CellProfiler after alignment and extract ROI pixel coordinates in the final shared coordinate frame.
+4. **Resegment aligned images** — rerun CellProfiler after alignment, generate actual organoid-mask containment QC, and extract ROI pixel coordinates in the final shared coordinate frame.
 5. **Apply intensity visualization + filter** — inspect intensity distributions and perform the first ROI-scrubbing pass using intensity only.
 6. **Apply shape-based filter** — inspect geometry only after the intensity gate, then apply the final shape/area gate to the intensity-passing ROI population.
 7. **Apply nuclear colocalization for ROI → Cell identity** — match each marker ROI to a nuclear ROI. The persistent cross-run identity anchor is the **nuclear ObjectID**; pairwise `CellID` values remain run-local.

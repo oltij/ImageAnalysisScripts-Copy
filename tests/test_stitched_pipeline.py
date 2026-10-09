@@ -236,6 +236,7 @@ class StitchedPipelineTests(unittest.TestCase):
             raw = json.loads(config_path.read_text(encoding="utf-8"))
             raw["alignment"]["enabled"] = True
             raw["reports"] = {
+                "organoid_mask": True,
                 "intensity": True,
                 "shape": True,
                 "colocalization": True,
@@ -260,6 +261,7 @@ class StitchedPipelineTests(unittest.TestCase):
                 def cp(self, label, image, out):
                     self.calls.append(("cp", label, image, out))
                     expected = [
+                        out / "OrganoidMask.tiff",
                         out / "CellMask.tiff",
                         out / "MyExpt_FilterObjects2.csv",
                         out / "MyExpt_FilterObjects.csv",
@@ -300,6 +302,7 @@ class StitchedPipelineTests(unittest.TestCase):
                 "04_aligned_cp_DNA",
                 "04_aligned_cp_LHX6",
                 "04_aligned_cp_PV",
+                "04_organoid_mask_qc",
                 "04_roi_DNA",
                 "04_roi_LHX6",
                 "04_roi_PV",

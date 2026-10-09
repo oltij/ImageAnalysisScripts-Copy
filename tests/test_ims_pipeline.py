@@ -93,6 +93,7 @@ class IMSPipelineTests(unittest.TestCase):
             "virus_channel_by_sample": virus_channel_by_sample or {},
             "ims_unit": "um",
             "trim_zero_padding": True,
+            "analysis_downsampling": {"factor": 3, "method": "area_mean"},
             "stitching": {"grid": [2, 2]},
             "analysis": self._analysis_settings(),
         }
@@ -246,8 +247,34 @@ class IMSPipelineTests(unittest.TestCase):
             outputs = ims.projection_paths(tmp / "preprocessing", acquisition)
             generated = ims.downstream_config(cfg, acquisition, metadata, outputs)
             self.assertEqual(generated["nuclear_channel"], "Hoechst")
-            self.assertEqual(generated["pixel_size_um"], {"x": 0.5, "y": 0.6})
+            self.assertAlmostEqual(generated["pixel_size_um"]["x"], 1.5)
+            self.assertAlmostEqual(generated["pixel_size_um"]["y"], 1.8)
             self.assertEqual(list(generated["channels"]), list(ims.CHANNEL_ORDER))
+
+    def test_area_mean_downsampling_crops_edges_and_preserves_dtype(self):
+        image = np.arange(5 * 7, dtype=np.uint16).reshape(5, 7)
+        reduced, details = ims.area_mean_downsample(image, 3)
+        expected = np.array(
+            [[np.rint(image[0:3, 0:3].mean()), np.rint(image[0:3, 3:6].mean())]],
+            dtype=np.uint16,
+        )
+        np.testing.assert_array_equal(reduced, expected)
+        self.assertEqual(reduced.dtype, image.dtype)
+        self.assertEqual(details["source_shape_yx"], [5, 7])
+        self.assertEqual(details["analysis_shape_yx"], [1, 2])
+        self.assertEqual(details["cropped_trailing_pixels_yx"], [2, 1])
+
+    def test_invalid_analysis_downsampling_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            source = tmp / "Sample.ims"
+            create_synthetic_ims(source)
+            config_path = self._write_config(tmp, source)
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw["analysis_downsampling"]["factor"] = 0
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "positive integer"):
+                ims.read_config(config_path)
 
     def test_dry_run_writes_no_output(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -313,11 +340,21 @@ class IMSPipelineTests(unittest.TestCase):
                 tmp / "output/generated_configs/Sample.stitched_pipeline.json"
             )
             generated = json.loads(generated_path.read_text(encoding="utf-8"))
-            self.assertEqual(generated["pixel_size_um"], {"x": 0.5, "y": 0.6})
+            self.assertAlmostEqual(generated["pixel_size_um"]["x"], 1.5)
+            self.assertAlmostEqual(generated["pixel_size_um"]["y"], 1.8)
             for channel in ims.CHANNEL_ORDER:
-                self.assertTrue(Path(generated["channels"][channel]).is_file())
+                analysis_path = Path(generated["channels"][channel])
+                self.assertTrue(analysis_path.is_file())
+                self.assertEqual(tifffile.imread(analysis_path).shape, (1, 2))
             metadata_path = tmp / "output/preprocessing/Sample/ims_metadata.json"
             self.assertTrue(metadata_path.is_file())
+            metadata_payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(metadata_payload["analysis_downsampling"]["factor"], 3)
+            effective = metadata_payload["analysis_downsampling"][
+                "effective_pixel_size_um"
+            ]
+            self.assertAlmostEqual(effective["x"], 1.5)
+            self.assertAlmostEqual(effective["y"], 1.8)
             top_manifest = json.loads(
                 (tmp / "output/ims_run_manifest.json").read_text()
             )

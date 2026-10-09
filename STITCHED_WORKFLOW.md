@@ -49,7 +49,7 @@ Important configuration fields:
 | `pairs` | Ordered marker pairs; A-inside-B overlap is directional |
 | `thresholds` | Explicit overlap fractions in `[0, 1]` |
 | `filters.intensity/shape` | Existing percentile rules; percentile `0` disables that metric |
-| `reports` | Enable or disable intensity, shape, and colocalization QC outputs |
+| `reports` | Enable or disable organoid-mask, intensity, shape, and colocalization QC outputs |
 
 Channel names must start with a letter and contain only ASCII letters, digits, and underscores.
 
@@ -83,6 +83,7 @@ stitched per-channel TIFFs
   -> initial CellProfiler segmentation (only when CASTalign is enabled)
   -> each marker registered to the common nuclear reference
   -> CellProfiler segmentation in the final coordinate frame
+  -> actual organoid-mask containment QC
   -> ROI reconstruction and pixel-coordinate export
   -> intensity QC, then intensity-only filtering
   -> shape QC on intensity survivors, then shape-only filtering
@@ -104,6 +105,7 @@ The output directory contains:
 01_initial_segmentation/        # only when alignment is enabled
 02_registration/                # only when alignment is enabled
 03_aligned_segmentation/
+04_organoid_mask_qc/            # when enabled
 04_roi_extraction/
 05_intensity_report/            # when enabled
 05_intensity_filtered/
@@ -122,12 +124,13 @@ CASTalign currently writes every moving image as `aligned_PV_max.tif`. For a dif
 The CellProfiler pipeline contract is intentionally strict. It must produce nonempty:
 
 ```text
+OrganoidMask.tiff
 CellMask.tiff
 MyExpt_FilterObjects.csv
 MyExpt_FilterObjects2.csv
 ```
 
-The controller stops immediately if a subprocess fails or one of its required handoff files is missing.
+The controller stops immediately if a subprocess fails or one of its required handoff files is missing. The organoid-mask QC reads the aligned fluorescence image, `OrganoidMask.tiff`, and `CellMask.tiff` from each final-frame CellProfiler pass. It writes the actual binary mask, a green-boundary/red-outside-cell overlay, and CSV statistics for mask area, components, largest component, border contact, and cell pixels outside the mask. It does not alter or add a segmentation filter.
 
 ## Scientific decisions that remain manual
 

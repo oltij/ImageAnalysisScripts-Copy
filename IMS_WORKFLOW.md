@@ -1,6 +1,6 @@
 # Complete workflow directly from Imaris IMS files
 
-`run_ims_pipeline.py` is the one-command entry point for the full pipeline. It reads `.ims` metadata, exports channel TIFFs, creates maximum projections, and then invokes `run_stitched_pipeline.py` for segmentation, registration, ROI filtering, nuclear association, and marker-pair analysis.
+`run_ims_pipeline.py` is the one-command entry point for the full pipeline. It reads `.ims` metadata, exports channel TIFFs, creates full-resolution maximum projections plus consistently downsampled analysis projections, and then invokes `run_stitched_pipeline.py` for segmentation, registration, ROI filtering, nuclear association, and marker-pair analysis.
 
 The scientific algorithms in the existing stitching and downstream scripts are reused unchanged. This controller supplies paths, fixed channel identities, and IMS calibration.
 
@@ -86,9 +86,12 @@ Edit at least:
 - `fiji_sif`: required for mosaic fields, otherwise it may be `null`;
 - `virus_channel`: normally `auto`, or explicitly `BiVe3`/`BiVe4`;
 - `virus_channel_by_sample`: optional overrides for mixed or ambiguously named organoids;
+- `analysis_downsampling`: defaults to 3× XY area-mean downsampling; use factor `1` only when intentionally analyzing at source resolution;
 - filter percentiles and overlap thresholds appropriate for the experiment.
 
-The XY and Z voxel sizes are read from `DataSetInfo/Image` extents and dimensions. `ims_unit` is used only when the IMS spatial-unit attribute is empty. The extracted X/Y calibration is passed into all downstream physical-area and shape calculations automatically.
+The XY and Z voxel sizes are read from `DataSetInfo/Image` extents and dimensions. `ims_unit` is used only when the IMS spatial-unit attribute is empty. The downstream X/Y calibration is the extracted IMS spacing multiplied by `analysis_downsampling.factor`; for a source spacing near 0.1043 µm/pixel and factor 3, the generated configuration therefore uses about 0.313 µm/pixel automatically.
+
+Area-mean downsampling uses complete, non-overlapping pixel blocks. If an edge is not divisible by the factor, at most `factor - 1` trailing rows or columns are omitted and the exact crop is recorded in `ims_metadata.json`. Full-resolution projections are retained for audit.
 
 The example's percentile value `0` disables that metric. It is a safe pass-through starting point, not a scientifically optimized threshold.
 
@@ -149,12 +152,14 @@ When wavelength metadata are available for every channel, the metadata report re
 │       ├── 02_basic_corrected/       # mosaic mode
 │       ├── 03_stitched/              # mosaic mode
 │       ├── 04_max_projections/
+│       ├── 05_analysis_projections/   # 3× XY by default
 │       └── ims_metadata.json
 └── analysis/
     └── <sample>/
         ├── 01_initial_segmentation/
         ├── 02_registration/
         ├── 03_aligned_segmentation/
+        ├── 04_organoid_mask_qc/
         ├── 04_roi_extraction/
         ├── 05_intensity_filtered/
         ├── 06_final_shape_filtered/
@@ -173,8 +178,9 @@ Before a batch analysis, inspect:
 1. `ims_metadata.json` for channel mapping and calibration;
 2. the four TIFFs in `04_max_projections/`;
 3. BigStitcher logs and fused images when using mosaic mode;
-4. `03_aligned_segmentation/<channel>/CellMask.tiff`;
-5. intensity and shape QC reports;
-6. registration overlays and final cell-population counts.
+4. `03_aligned_segmentation/<channel>/OrganoidMask.tiff` and `CellMask.tiff`;
+5. `04_organoid_mask_qc/organoid_mask_qc.png` and its statistics CSV;
+6. intensity and shape QC reports;
+7. registration overlays and final cell-population counts.
 
 The controller automates data movement and execution order; it does not choose biologically appropriate segmentation settings, filter cutoffs, or overlap thresholds.
