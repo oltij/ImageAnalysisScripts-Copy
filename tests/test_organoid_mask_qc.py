@@ -28,14 +28,19 @@ class OrganoidMaskQCTests(unittest.TestCase):
 
             fluorescence_path = tmp / "fluorescence.tif"
             organoid_path = tmp / "OrganoidMask.tiff"
+            reference_path = tmp / "HoechstOrganoidMask.tiff"
             cell_path = tmp / "CellMask.tiff"
+            reference = np.zeros((6, 6), dtype=np.uint16)
+            reference[0:3, 0:3] = 1
             tifffile.imwrite(fluorescence_path, fluorescence)
             tifffile.imwrite(organoid_path, organoid)
+            tifffile.imwrite(reference_path, reference)
             tifffile.imwrite(cell_path, cells)
 
             figure_path, csv_path = qc.run_qc(
                 [("Hoechst", fluorescence_path, organoid_path, cell_path)],
                 tmp / "qc",
+                reference_path,
             )
 
             self.assertTrue(figure_path.is_file())
@@ -51,6 +56,15 @@ class OrganoidMaskQCTests(unittest.TestCase):
             self.assertAlmostEqual(
                 float(row["cell_pixels_outside_organoid_percent"]), 20.0
             )
+            self.assertEqual(int(row["hoechst_reference_mask_area_pixels"]), 9)
+            self.assertEqual(int(row["organoid_mask_disagreement_pixels"]), 4)
+            self.assertEqual(int(row["organoid_mask_pixels_outside_reference"]), 4)
+            self.assertEqual(int(row["reference_mask_pixels_missing_from_organoid"]), 0)
+            self.assertEqual(int(row["cell_pixels_outside_hoechst_reference"]), 1)
+            self.assertAlmostEqual(
+                float(row["cell_pixels_outside_hoechst_reference_percent"]),
+                20.0,
+            )
 
     def test_qc_rejects_shape_mismatch(self):
         with self.assertRaisesRegex(ValueError, "different shapes"):
@@ -58,6 +72,7 @@ class OrganoidMaskQCTests(unittest.TestCase):
                 "PV",
                 np.ones((3, 3), dtype=bool),
                 np.ones((4, 3), dtype=bool),
+                np.ones((3, 3), dtype=bool),
             )
 
 

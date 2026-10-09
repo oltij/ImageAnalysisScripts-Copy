@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This script runs a CellProfiler `.cppipe` pipeline headlessly on **one input image** and collects all outputs into one specified directory.
+This script runs a CellProfiler `.cppipe` pipeline headlessly on **one fluorescence image**, with an optional aligned organoid-mask image, and collects all outputs into one specified directory.
 
 It is designed for:
 
@@ -10,6 +10,8 @@ It is designed for:
 CellProfiler pipeline
 +
 one microscopy image
++
+optional aligned organoid mask
 +
 one output directory
 ```
@@ -222,6 +224,10 @@ The script requires:
 --output
 ```
 
+It also accepts optional `--organoid-mask`. This is used by the automated
+stitched-image controller for final marker segmentation and requires the
+controller-generated two-input pipeline.
+
 ### `--pipeline`
 
 Path to a CellProfiler pipeline:
@@ -261,6 +267,13 @@ Example:
 ```
 
 The script creates the directory automatically if needed.
+
+### `--organoid-mask`
+
+Optional path to the final-coordinate Hoechst `OrganoidMask.tiff`. When
+supplied, the driver links it beside the fluorescence input under the stable
+name expected by the generated CellProfiler pipeline. The initial
+pre-registration passes do not use this argument.
 
 ## Basic usage
 
@@ -567,7 +580,10 @@ The centroid CSV can then be used by the registration script.
 
 ### After alignment
 
-Run CellProfiler again on the aligned images.
+The automated controller first runs CellProfiler on final-frame Hoechst to
+create the reference organoid mask. It then runs every aligned marker with
+that mask as the optional second input. Marker fluorescence still drives cell
+detection; the Hoechst mask supplies the common tissue boundary.
 
 Conceptually:
 
@@ -586,9 +602,10 @@ ROI extraction
 
 These post-alignment ROIs are used for downstream filtering and colocalization.
 
-## One image per invocation
+## One fluorescence image per invocation
 
-The script is intentionally designed to process one image at a time.
+The script is intentionally designed to process one fluorescence image at a
+time. Final marker runs may additionally receive one shared mask.
 
 For multiple channels, run it once per channel.
 

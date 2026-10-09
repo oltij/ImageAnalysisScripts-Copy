@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Run the existing ImageAnalysisScripts stages from channel-specific stitched TIFFs.
+"""Run the ImageAnalysisScripts stages from channel-specific stitched TIFFs.
 
-No scientific analysis code is modified. Scripts with file-level USER SETTINGS are
-copied temporarily and ONLY their top-level assignment values are replaced.
+Initial CellProfiler segmentation uses the configured pipeline unchanged. For final
+marker segmentation, a derived copy loads the aligned Hoechst organoid mask as a
+second input while preserving marker-specific cell detection and other settings.
 See STITCHED_WORKFLOW.md before using this on experimental data.
 """
 
@@ -24,6 +25,9 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+
+import numpy as np
+import tifffile
 
 ROOT = Path(__file__).resolve().parent
 
@@ -66,6 +70,10 @@ EXPECTED_CP_PIPELINE_SETTINGS = (
 MAIN_RUNTIME_MODULES = (
     "h5py", "matplotlib", "numpy", "pandas", "PIL", "scipy", "skimage", "tifffile",
 )
+
+SHARED_MASK_IMAGE_NAME = "HoechstOrganoidMask"
+SHARED_FLUORESCENCE_TOKEN = "__analysis_fluorescence__"
+SHARED_MASK_TOKEN = "__hoechst_organoid_mask__"
 
 
 def path_value(value: object) -> str:
@@ -147,6 +155,133 @@ def validate_cellprofiler_pipeline(path: Path) -> str:
             f"missing settings for expected outputs: {missing}"
         )
     return pipeline_text
+
+
+def cellprofiler_module(text: str, name: str) -> tuple[re.Match[str], str]:
+    match = re.search(
+        rf"(?ms)^{re.escape(name)}:\[.*?(?=^[A-Za-z][A-Za-z0-9]*:\[|\Z)",
+        text,
+    )
+    if match is None:
+        raise ValueError(f"CellProfiler pipeline is missing required module {name}")
+    return match, match.group(0).rstrip()
+
+
+def write_shared_mask_pipeline(source: Path, destination: Path) -> Path:
+    """Derive a final-marker pipeline that uses an aligned Hoechst tissue mask."""
+    text = validate_cellprofiler_pipeline(source)
+    names_match, names_block = cellprofiler_module(text, "NamesAndTypes")
+    required_names = (
+        "Assign a name to:All images",
+        "Assignments count:1",
+        "Name to assign these images:DNA",
+    )
+    missing = [setting for setting in required_names if setting not in names_block]
+    if missing:
+        raise ValueError(
+            "Cannot derive the shared-mask pipeline from this NamesAndTypes "
+            f"configuration; missing {missing}"
+        )
+    names_header = names_block.splitlines()[0]
+    shared_names = (
+        f"{names_header}\n"
+        "    Assign a name to:Images matching rules\n"
+        "    Select the image type:Grayscale image\n"
+        "    Name to assign these images:DNA\n"
+        "    Match metadata:[]\n"
+        "    Image set matching method:Order\n"
+        "    Set intensity range from:Image metadata\n"
+        "    Assignments count:2\n"
+        "    Single images count:0\n"
+        "    Maximum intensity:255.0\n"
+        "    Process as 3D?:No\n"
+        "    Relative pixel spacing in X:1.0\n"
+        "    Relative pixel spacing in Y:1.0\n"
+        "    Relative pixel spacing in Z:1.0\n"
+        f'    Select the rule criteria:and (file does contain "{SHARED_FLUORESCENCE_TOKEN}")\n'
+        "    Name to assign these images:DNA\n"
+        "    Name to assign these objects:Cell\n"
+        "    Select the image type:Grayscale image\n"
+        "    Set intensity range from:Image metadata\n"
+        "    Maximum intensity:255.0\n"
+        f'    Select the rule criteria:and (file does contain "{SHARED_MASK_TOKEN}")\n'
+        f"    Name to assign these images:{SHARED_MASK_IMAGE_NAME}\n"
+        "    Name to assign these objects:Cell\n"
+        "    Select the image type:Grayscale image\n"
+        "    Set intensity range from:Image metadata\n"
+        "    Maximum intensity:255.0"
+    )
+    text = text[: names_match.start()] + shared_names + "\n\n" + text[names_match.end() :]
+
+    convert_match, convert_block = cellprofiler_module(text, "ConvertImageToObjects")
+    required_convert = (
+        "Select the input image:Threshold",
+        "Name the output object:ConvertImageToObjects",
+    )
+    missing = [
+        setting for setting in required_convert if setting not in convert_block
+    ]
+    if missing:
+        raise ValueError(
+            "Cannot derive the shared-mask pipeline from ConvertImageToObjects; "
+            f"missing {missing}"
+        )
+    shared_convert = convert_block.replace(
+        "Select the input image:Threshold",
+        f"Select the input image:{SHARED_MASK_IMAGE_NAME}",
+        1,
+    )
+    text = (
+        text[: convert_match.start()]
+        + shared_convert
+        + "\n\n"
+        + text[convert_match.end() :]
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(".cppipe.tmp")
+    temporary.write_text(text.rstrip() + "\n", encoding="utf-8")
+    temporary.replace(destination)
+    validate_cellprofiler_pipeline(destination)
+    return destination
+
+
+def read_binary_mask(path: Path, label: str) -> np.ndarray:
+    array = np.squeeze(tifffile.imread(path))
+    if array.ndim != 2:
+        raise ValueError(f"{label} must be a 2-D TIFF, got {array.shape}: {path}")
+    return array > 0
+
+
+def validate_shared_mask_canvas(image: Path, organoid_mask: Path) -> None:
+    image_info = inspect_tiff(image)
+    if image_info["projection_required"]:
+        raise ValueError(f"Shared-mask fluorescence must already be 2-D: {image}")
+    mask = read_binary_mask(organoid_mask, "Hoechst organoid mask")
+    if tuple(image_info["yx_shape"]) != mask.shape:
+        raise ValueError(
+            "Aligned marker and Hoechst organoid mask have different XY shapes: "
+            f"{image_info['yx_shape']} versus {mask.shape}"
+        )
+
+
+def verify_shared_mask_outputs(
+    reference_path: Path, organoid_path: Path, cell_path: Path
+) -> None:
+    reference = read_binary_mask(reference_path, "Hoechst organoid mask")
+    organoid = read_binary_mask(organoid_path, "marker organoid mask")
+    cells = read_binary_mask(cell_path, "marker cell mask")
+    if reference.shape != organoid.shape or reference.shape != cells.shape:
+        raise RuntimeError(
+            "Shared-mask CellProfiler outputs do not match the Hoechst mask canvas"
+        )
+    disagreement = int(np.count_nonzero(organoid ^ reference))
+    outside = int(np.count_nonzero(cells & ~reference))
+    if disagreement or outside:
+        raise RuntimeError(
+            "Shared Hoechst-mask verification failed: "
+            f"{disagreement} organoid-mask pixels disagree and "
+            f"{outside} segmented cell pixels are outside the Hoechst mask"
+        )
 
 
 def inspect_tiff(path: Path) -> dict[str, object]:
@@ -431,6 +566,12 @@ class Runner:
             self.completed = {}
             self.started_at = datetime.now(timezone.utc).isoformat()
             self.save()
+        self.shared_mask_pipeline = write_shared_mask_pipeline(
+            cfg["_pipeline"],
+            self.out
+            / "generated_cellprofiler"
+            / "final_marker_with_hoechst_mask.cppipe",
+        )
 
     def save(self) -> None:
         payload = {
@@ -492,24 +633,48 @@ class Runner:
             target.write_bytes(patched_source(script, replacements))
             self.execute(label, [sys.executable, str(target)], expected)
 
-    def cp(self, label: str, image: Path, out: Path) -> None:
+    def cp(
+        self,
+        label: str,
+        image: Path,
+        out: Path,
+        organoid_mask: Path | None = None,
+    ) -> None:
         cp = self.cfg.get("cellprofiler", {})
         environment = cp.get("conda_env", "cellprofiler-native")
         conda = cp.get("conda_executable", "conda")
+        pipeline = self.cfg["_pipeline"]
+        if organoid_mask is not None:
+            validate_shared_mask_canvas(image, organoid_mask)
+            pipeline = self.shared_mask_pipeline
         cmd = [conda, "run", "--no-capture-output", "-n", environment, "python",
                str(ROOT / "CellProfiler/cellprofilerdriver.py"),
-               "--pipeline", str(self.cfg["_pipeline"]),
+               "--pipeline", str(pipeline),
                "--input", str(image), "--output", str(out)]
+        if organoid_mask is not None:
+            cmd.extend(["--organoid-mask", str(organoid_mask)])
+        expected = [
+            out / "OrganoidMask.tiff",
+            out / "CellMask.tiff",
+            out / "MyExpt_FilterObjects2.csv",
+            out / "MyExpt_FilterObjects.csv",
+        ]
         self.execute(
             label,
             cmd,
-            [
-                out / "OrganoidMask.tiff",
-                out / "CellMask.tiff",
-                out / "MyExpt_FilterObjects2.csv",
-                out / "MyExpt_FilterObjects.csv",
-            ],
+            expected,
         )
+        if organoid_mask is not None:
+            try:
+                verify_shared_mask_outputs(
+                    organoid_mask,
+                    out / "OrganoidMask.tiff",
+                    out / "CellMask.tiff",
+                )
+            except Exception:
+                self.completed.pop(label, None)
+                self.save()
+                raise
 
 
 def ensure_projection(source: Path, destination: Path) -> Path:
@@ -612,9 +777,17 @@ def run(cfg: dict, resume: bool) -> None:
         aligned.update({name: images[name] for name in markers})
 
     aligned_cp: dict[str, Path] = {}
-    for name in names:
+    aligned_cp[nuc] = r.out / "03_aligned_segmentation" / nuc
+    r.cp(f"04_aligned_cp_{nuc}", aligned[nuc], aligned_cp[nuc])
+    reference_mask = aligned_cp[nuc] / "OrganoidMask.tiff"
+    for name in markers:
         aligned_cp[name] = r.out / "03_aligned_segmentation" / name
-        r.cp(f"04_aligned_cp_{name}", aligned[name], aligned_cp[name])
+        r.cp(
+            f"04_aligned_cp_{name}",
+            aligned[name],
+            aligned_cp[name],
+            organoid_mask=reference_mask,
+        )
 
     if reports.get("organoid_mask", True):
         out = r.out / "04_organoid_mask_qc"
@@ -623,6 +796,8 @@ def run(cfg: dict, resume: bool) -> None:
             str(ROOT / "QC/organoid_mask_qc.py"),
             "--output-dir",
             str(out),
+            "--reference-mask",
+            str(reference_mask),
         ]
         for name in names:
             command.extend(
@@ -766,9 +941,11 @@ def main(argv: list[str] | None = None) -> int:
         if cfg.get("alignment", {}).get("enabled", True):
             print("  01  initial CellProfiler segmentation for registration")
             print("  02  CASTalign each marker to the nuclear reference")
-        print("  03  CellProfiler segmentation in the final coordinate frame")
+        print("  03a final-frame Hoechst segmentation establishes tissue mask")
+        if cfg["_markers"]:
+            print("  03b marker-specific detection inside the shared Hoechst mask")
         if cfg.get("reports", {}).get("organoid_mask", True):
-            print("  04a actual organoid-mask containment QC")
+            print("  04a Hoechst-reference mask equality and containment QC")
         print("  04b ROI reconstruction and pixel-coordinate export")
         if cfg.get("reports", {}).get("intensity", True):
             print("  05a intensity QC report")

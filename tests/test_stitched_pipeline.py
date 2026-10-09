@@ -129,6 +129,84 @@ class StitchedPipelineTests(unittest.TestCase):
         self.assertTrue(text.startswith("CellProfiler Pipeline:"))
         self.assertIn("ModuleCount:24", text)
 
+    def test_shared_mask_pipeline_rewires_only_the_organoid_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "shared.cppipe"
+            source = runner.ROOT / "CellProfiler/MGEOPVFinal.cppipe"
+            runner.write_shared_mask_pipeline(
+                source, destination
+            )
+            text = destination.read_text(encoding="utf-8")
+            self.assertIn("Assignments count:2", text)
+            self.assertIn(
+                'file does contain "__analysis_fluorescence__"', text
+            )
+            self.assertIn(
+                'file does contain "__hoechst_organoid_mask__"', text
+            )
+            self.assertIn(
+                "Select the input image:HoechstOrganoidMask", text
+            )
+            self.assertIn(
+                "Select the input image:EnhanceOrSuppressFeatures", text
+            )
+            self.assertIn(
+                "Select the measurement to filter by:AreaShape_MinFeretDiameter",
+                text,
+            )
+            self.assertIn("ModuleCount:24", text)
+
+            def without_module(pipeline_text, name):
+                match, _ = runner.cellprofiler_module(pipeline_text, name)
+                return (
+                    pipeline_text[: match.start()]
+                    + f"<{name}>\n\n"
+                    + pipeline_text[match.end() :]
+                )
+
+            normalized = text.replace(
+                "Select the input image:HoechstOrganoidMask",
+                "Select the input image:Threshold",
+            )
+            original_remainder = without_module(
+                without_module(source.read_text(encoding="utf-8"), "NamesAndTypes"),
+                "ConvertImageToObjects",
+            )
+            generated_remainder = without_module(
+                without_module(normalized, "NamesAndTypes"),
+                "ConvertImageToObjects",
+            )
+            self.assertEqual(
+                generated_remainder.strip(), original_remainder.strip()
+            )
+
+    def test_shared_mask_verification_checks_equality_and_containment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            fluorescence = tmp / "marker.tif"
+            reference_path = tmp / "reference.tif"
+            organoid_path = tmp / "organoid.tif"
+            cell_path = tmp / "cells.tif"
+            reference = np.zeros((5, 6), dtype=np.uint16)
+            reference[1:4, 1:5] = 1
+            cells = np.zeros_like(reference)
+            cells[2, 2] = 3
+            tifffile.imwrite(fluorescence, np.ones_like(reference))
+            tifffile.imwrite(reference_path, reference)
+            tifffile.imwrite(organoid_path, reference)
+            tifffile.imwrite(cell_path, cells)
+            runner.validate_shared_mask_canvas(fluorescence, reference_path)
+            runner.verify_shared_mask_outputs(
+                reference_path, organoid_path, cell_path
+            )
+
+            cells[0, 0] = 4
+            tifffile.imwrite(cell_path, cells)
+            with self.assertRaisesRegex(RuntimeError, "outside the Hoechst mask"):
+                runner.verify_shared_mask_outputs(
+                    reference_path, organoid_path, cell_path
+                )
+
     def test_binary_project_renamed_cppipe_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             fake = Path(tmp) / "bad.cppipe"
@@ -258,8 +336,8 @@ class StitchedPipelineTests(unittest.TestCase):
                         path.parent.mkdir(parents=True, exist_ok=True)
                         path.write_bytes(b"test-output")
 
-                def cp(self, label, image, out):
-                    self.calls.append(("cp", label, image, out))
+                def cp(self, label, image, out, organoid_mask=None):
+                    self.calls.append(("cp", label, image, out, organoid_mask))
                     expected = [
                         out / "OrganoidMask.tiff",
                         out / "CellMask.tiff",
@@ -323,6 +401,25 @@ class StitchedPipelineTests(unittest.TestCase):
             self.assertEqual(labels, expected_labels)
 
             calls_by_label = {call[1]: call for call in fake.calls}
+            reference_mask = (
+                cfg["_output"]
+                / "03_aligned_segmentation"
+                / "DNA"
+                / "OrganoidMask.tiff"
+            )
+            self.assertIsNone(calls_by_label["02_initial_cp_LHX6"][4])
+            self.assertIsNone(calls_by_label["04_aligned_cp_DNA"][4])
+            self.assertEqual(
+                calls_by_label["04_aligned_cp_LHX6"][4], reference_mask
+            )
+            self.assertEqual(
+                calls_by_label["04_aligned_cp_PV"][4], reference_mask
+            )
+            qc_command = calls_by_label["04_organoid_mask_qc"][2]
+            self.assertEqual(
+                Path(qc_command[qc_command.index("--reference-mask") + 1]),
+                reference_mask,
+            )
             shape_gate = calls_by_label["06_shape_gate"]
             shape_channels = shape_gate[3]["channels"]
             self.assertIn("05_intensity_filtered/LHX6/LHX6_ROI_pixels_FILTERED.csv", shape_channels)
