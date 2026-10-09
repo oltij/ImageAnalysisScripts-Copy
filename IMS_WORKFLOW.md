@@ -12,12 +12,30 @@ Every input IMS file must contain exactly four channels in this ascending-wavele
 |---:|---|---|
 | 0 | Hoechst | `Hoechst` |
 | 1 | mNeonGreen | `mNeonGreen` |
-| 2 | BiVe3 virus | `BiVe3` |
+| 2 | BiVe3 virus or BiVe4 virus | `BiVe3` or `BiVe4` |
 | 3 | PV | `PV` |
 
 Assignment is based on the zero-based channel index, not the possibly inconsistent channel name stored by Imaris. The original Imaris channel name and any available wavelength attributes are preserved in `ims_metadata.json` for auditability.
 
-Hoechst is automatically used as the nuclear reference. The shorter name `BiVe3` is used because downstream channel identifiers allow only letters, numbers, and underscores.
+Hoechst is automatically used as the nuclear reference. Channel 2 remains fixed by index, while its biological name is resolved separately for each organoid. The short names `BiVe3` and `BiVe4` are used because downstream channel identifiers allow only letters, numbers, and underscores.
+
+By default, `virus_channel` is `auto`. The controller looks for `BiVe3` or `BiVe4` in the organoid/file name and in the Imaris metadata for channel 2. If neither is present, specify one virus for the whole run:
+
+```json
+"virus_channel": "BiVe4"
+```
+
+For a directory containing a mixture, use exact discovered sample names as overrides:
+
+```json
+"virus_channel": "auto",
+"virus_channel_by_sample": {
+  "Organoid_01": "BiVe3",
+  "Organoid_02": "BiVe4"
+}
+```
+
+An explicit per-sample value takes precedence over `virus_channel`. The `Virus` entries in `analysis.pairs` are replaced with the resolved label for each organoid, so TIFF names, result folders, metadata, and colocalization pairs consistently use `BiVe3` or `BiVe4`.
 
 ## Supported IMS layouts
 
@@ -66,6 +84,8 @@ Edit at least:
 - `input_mode`: normally `auto`;
 - `output_dir`: a new or empty directory;
 - `fiji_sif`: required for mosaic fields, otherwise it may be `null`;
+- `virus_channel`: normally `auto`, or explicitly `BiVe3`/`BiVe4`;
+- `virus_channel_by_sample`: optional overrides for mixed or ambiguously named organoids;
 - filter percentiles and overlap thresholds appropriate for the experiment.
 
 The XY and Z voxel sizes are read from `DataSetInfo/Image` extents and dimensions. `ims_unit` is used only when the IMS spatial-unit attribute is empty. The extracted X/Y calibration is passed into all downstream physical-area and shape calculations automatically.
@@ -110,7 +130,7 @@ Before output creation, the controller verifies:
 - all fields in a mosaic have compatible channel shapes and voxel calibration;
 - mosaic field count matches `stitching.grid` and field numbers are contiguous from `F00`;
 - every IMS file has exactly one timepoint at its native resolution;
-- the fixed channel order is unchanged;
+- the fixed channel positions are unchanged and channel 2 resolves to BiVe3 or BiVe4;
 - the generated downstream configuration is valid.
 
 When wavelength metadata are available for every channel, the metadata report records whether they are ascending. The declared index order remains the identity source because it is the acquisition convention specified for this project.

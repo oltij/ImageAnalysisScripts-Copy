@@ -3,7 +3,9 @@
   "input_mode": "auto",
   "output_dir": "/path/to/new/complete_analysis_output",
   "fiji_sif": "/path/to/fiji_latest_bigstitcher.sif",
-  "channel_order": ["Hoechst", "mNeonGreen", "BiVe3", "PV"],
+  "channel_order": ["Hoechst", "mNeonGreen", "Virus", "PV"],
+  "virus_channel": "auto",
+  "virus_channel_by_sample": {},
   "ims_unit": "um",
   "trim_zero_padding": true,
   "stitching": {
@@ -27,9 +29,9 @@
       "extra_args": []
     },
     "pairs": [
-      ["mNeonGreen", "BiVe3"],
+      ["mNeonGreen", "Virus"],
       ["mNeonGreen", "PV"],
-      ["BiVe3", "PV"]
+      ["Virus", "PV"]
     ],
     "thresholds": {
       "marker_nuclear": 0.25,
