@@ -8,6 +8,19 @@ This README describes the end-to-end workflow for a tiled microscopy acquisition
 
 The document is organized around **eight pipeline steps**. Those eight steps are the authoritative processing order. The four larger phases describe what the pipeline is doing conceptually; they do **not** add extra processing steps.
 
+### Start from Imaris-stitched TIFFs
+
+When stitching is already complete in Imaris, `run_stitched_pipeline.py` provides a linear entry point at Step 2 and leaves the optional IMS/BaSiC/BigStitcher route intact. It validates one single-channel TIFF per channel, runs the existing scripts in order, carries every output path into the next stage, invokes the separate CellProfiler environment automatically, logs execution, and supports provenance-checked resume.
+
+```bash
+cp stitched_pipeline.example.json stitched_pipeline.json
+# Edit input paths, calibration, thresholds, and filters.
+python run_stitched_pipeline.py --config stitched_pipeline.json --dry-run
+python run_stitched_pipeline.py --config stitched_pipeline.json
+```
+
+Read [`STITCHED_WORKFLOW.md`](STITCHED_WORKFLOW.md) before using experimental data. [`SCRIPT_HANDOFF_REFERENCE.md`](SCRIPT_HANDOFF_REFERENCE.md) lists the input/output contract for every original script. Historical pixel sizes and zero-percentile filter examples are not automatically valid for a new acquisition.
+
 ```text
 ENV
  |

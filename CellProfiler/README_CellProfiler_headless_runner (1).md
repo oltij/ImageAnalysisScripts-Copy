@@ -105,6 +105,8 @@ Use the headless runner documented in this README together with:
 MGEOPVFinal.cppipe
 ```
 
+The checked-in `MGEOPVFinal.cppipe` is a genuine text pipeline. It was exported unchanged from the pipeline embedded in the previously project-formatted file so CellProfiler's `-p` command-line option can load it reliably. Do not substitute the binary `MGEOPV.cpproj` in a headless command.
+
 Example:
 
 ```bash
@@ -694,6 +696,8 @@ MGEOPVFinal.cppipe
 for the headless command-line workflow described by this script.
 
 The `.cpproj` and `.cppipe` files serve different usage modes and should not be treated as interchangeable command-line inputs.
+
+The stitched-image controller also checks the file signature and required output settings before starting; a project/HDF5 file renamed with a `.cppipe` extension is rejected with an actionable error.
 
 ## Minimal command
 
