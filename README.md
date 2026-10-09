@@ -12,6 +12,11 @@ The document is organized around **eight pipeline steps**. Those eight steps are
 
 `run_ims_pipeline.py` is the complete entry point when the source data are `.ims` files. It supports both `_F00.ims`…`_F03.ims` mosaic fields and one IMS file already stitched in Imaris. It assigns channel indices 0–3 to Hoechst, mNeonGreen, BiVe3/BiVe4 virus, and PV; resolves the virus label separately for each organoid; records Imaris names/wavelength metadata; retains full-resolution projections; creates explicitly configured area-mean analysis projections with automatically adjusted calibration; and then invokes every downstream stage automatically.
 
+IMS preprocessing writes TIFF intermediates through validated temporary files
+and atomic renames. Resume checks TIFF structure, dimensions, data type, and
+pixel-data bounds instead of trusting a nonempty filename, so an interrupted
+write is regenerated safely.
+
 ```bash
 cp ims_pipeline.example.json ims_pipeline.json
 # Edit IMS/output/SIF paths and scientific settings.
