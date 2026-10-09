@@ -276,6 +276,25 @@ class IMSPipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "positive integer"):
                 ims.read_config(config_path)
 
+    def test_downsampling_and_padding_choices_must_be_explicit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            source = tmp / "Sample.ims"
+            create_synthetic_ims(source)
+            config_path = self._write_config(tmp, source)
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw.pop("analysis_downsampling")
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "explicitly configured"):
+                ims.read_config(config_path)
+
+            config_path = self._write_config(tmp, source)
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw.pop("trim_zero_padding")
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "explicitly true or false"):
+                ims.read_config(config_path)
+
     def test_dry_run_writes_no_output(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)

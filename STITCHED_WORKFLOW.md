@@ -2,7 +2,7 @@
 
 `run_stitched_pipeline.py` connects the existing analysis programs without changing their scientific calculations. It starts with one already stitched TIFF per channel, skips IMS export/BaSiC/BigStitcher, and runs segmentation through final colocalization in the repository's established order.
 
-The controller substitutes only each script's top-level `USER SETTINGS` in a temporary copy. The checked-in source scripts, matching logic, metric calculations, and percentile rules remain the authoritative implementations.
+The controller substitutes only each analysis script's top-level `USER SETTINGS` in a temporary copy. Initial CellProfiler passes use the configured `.cppipe` unchanged. The final marker passes use a generated copy that changes only image assignment and the organoid-object source so the aligned Hoechst mask is shared; marker cell-detection settings remain authoritative and unchanged.
 
 ## Before the first run
 
@@ -82,8 +82,10 @@ stitched per-channel TIFFs
   -> max projection when needed
   -> initial CellProfiler segmentation (only when CASTalign is enabled)
   -> each marker registered to the common nuclear reference
-  -> CellProfiler segmentation in the final coordinate frame
-  -> actual organoid-mask containment QC
+  -> final-frame Hoechst segmentation establishes the shared tissue mask
+  -> each marker independently detects cells inside that Hoechst mask
+  -> shared-mask equality and containment verification
+  -> Hoechst-reference organoid-mask QC
   -> ROI reconstruction and pixel-coordinate export
   -> intensity QC, then intensity-only filtering
   -> shape QC on intensity survivors, then shape-only filtering
@@ -105,6 +107,7 @@ The output directory contains:
 01_initial_segmentation/        # only when alignment is enabled
 02_registration/                # only when alignment is enabled
 03_aligned_segmentation/
+generated_cellprofiler/         # derived final-marker pipeline
 04_organoid_mask_qc/            # when enabled
 04_roi_extraction/
 05_intensity_report/            # when enabled
@@ -130,7 +133,9 @@ MyExpt_FilterObjects.csv
 MyExpt_FilterObjects2.csv
 ```
 
-The controller stops immediately if a subprocess fails or one of its required handoff files is missing. The organoid-mask QC reads the aligned fluorescence image, `OrganoidMask.tiff`, and `CellMask.tiff` from each final-frame CellProfiler pass. It writes the actual binary mask, a green-boundary/red-outside-cell overlay, and CSV statistics for mask area, components, largest component, border contact, and cell pixels outside the mask. It does not alter or add a segmentation filter.
+The controller stops immediately if a subprocess fails or one of its required handoff files is missing. After final Hoechst segmentation, each marker CellProfiler run receives the Hoechst `OrganoidMask.tiff` as a second image. The generated pipeline converts that mask into the existing `FilterObjects` organoid object; the existing `MaskObjects` step therefore restricts marker-specific detections to the common tissue boundary. The controller then requires the saved marker `OrganoidMask.tiff` to equal the Hoechst reference exactly and requires zero marker cell pixels outside it.
+
+The organoid-mask QC compares every final channel with the Hoechst reference. Its figure shows fluorescence, the channel's saved mask, the Hoechst mask, and an overlay with the reference boundary in green, mask disagreement in magenta, and cell pixels outside the reference in red. Its CSV records disagreement, missing/excess mask pixels, and marker-cell pixels outside Hoechst in addition to the original mask geometry statistics. It reports and verifies results without adding another downstream spatial filter.
 
 ## Scientific decisions that remain manual
 

@@ -86,12 +86,13 @@ Edit at least:
 - `fiji_sif`: required for mosaic fields, otherwise it may be `null`;
 - `virus_channel`: normally `auto`, or explicitly `BiVe3`/`BiVe4`;
 - `virus_channel_by_sample`: optional overrides for mixed or ambiguously named organoids;
-- `analysis_downsampling`: defaults to 3× XY area-mean downsampling; use factor `1` only when intentionally analyzing at source resolution;
+- `analysis_downsampling`: required explicitly for the acquisition resolution; use factor `3` for the current ~0.1043 µm/pixel images or factor `1` for images already near 0.313 µm/pixel;
+- `trim_zero_padding`: required explicitly; use `false` for fully stitched FusionStitcher files with legitimate dark image edges;
 - filter percentiles and overlap thresholds appropriate for the experiment.
 
 The XY and Z voxel sizes are read from `DataSetInfo/Image` extents and dimensions. `ims_unit` is used only when the IMS spatial-unit attribute is empty. The downstream X/Y calibration is the extracted IMS spacing multiplied by `analysis_downsampling.factor`; for a source spacing near 0.1043 µm/pixel and factor 3, the generated configuration therefore uses about 0.313 µm/pixel automatically.
 
-Area-mean downsampling uses complete, non-overlapping pixel blocks. If an edge is not divisible by the factor, at most `factor - 1` trailing rows or columns are omitted and the exact crop is recorded in `ims_metadata.json`. Full-resolution projections are retained for audit.
+Area-mean downsampling uses complete, non-overlapping pixel blocks. If an edge is not divisible by the factor, at most `factor - 1` trailing rows or columns are omitted and the exact crop is recorded in `ims_metadata.json`. Full-resolution projections are retained for audit. Downsampling is not flat-field, background, or illumination correction. Fully stitched IMS inputs continue to bypass BaSiC.
 
 The example's percentile value `0` disables that metric. It is a safe pass-through starting point, not a scientifically optimized threshold.
 
@@ -152,13 +153,14 @@ When wavelength metadata are available for every channel, the metadata report re
 │       ├── 02_basic_corrected/       # mosaic mode
 │       ├── 03_stitched/              # mosaic mode
 │       ├── 04_max_projections/
-│       ├── 05_analysis_projections/   # 3× XY by default
+│       ├── 05_analysis_projections/   # when configured factor is greater than 1
 │       └── ims_metadata.json
 └── analysis/
     └── <sample>/
         ├── 01_initial_segmentation/
         ├── 02_registration/
         ├── 03_aligned_segmentation/
+        ├── generated_cellprofiler/
         ├── 04_organoid_mask_qc/
         ├── 04_roi_extraction/
         ├── 05_intensity_filtered/
@@ -178,7 +180,7 @@ Before a batch analysis, inspect:
 1. `ims_metadata.json` for channel mapping and calibration;
 2. the four TIFFs in `04_max_projections/`;
 3. BigStitcher logs and fused images when using mosaic mode;
-4. `03_aligned_segmentation/<channel>/OrganoidMask.tiff` and `CellMask.tiff`;
+4. the Hoechst `OrganoidMask.tiff` and its exact reuse in every marker's final segmentation;
 5. `04_organoid_mask_qc/organoid_mask_qc.png` and its statistics CSV;
 6. intensity and shape QC reports;
 7. registration overlays and final cell-population counts.

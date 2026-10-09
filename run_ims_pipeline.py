@@ -518,23 +518,24 @@ def read_config(config_path: Path) -> dict[str, Any]:
     unit = raw.get("ims_unit", "um")
     if unit not in {"um", "nm", "mm", "m"}:
         raise ValueError("ims_unit must be um, nm, mm, or m")
-    trim = raw.get("trim_zero_padding", True)
+    if "trim_zero_padding" not in raw:
+        raise ValueError(
+            "trim_zero_padding must be explicitly true or false; use false for "
+            "fully stitched FusionStitcher acquisitions with legitimate dark edges"
+        )
+    trim = raw["trim_zero_padding"]
     if not isinstance(trim, bool):
         raise ValueError("trim_zero_padding must be true or false")
-    downsampling = raw.get(
-        "analysis_downsampling", {"factor": 3, "method": "area_mean"}
-    )
+    if "analysis_downsampling" not in raw:
+        raise ValueError(
+            "analysis_downsampling must be explicitly configured for this "
+            "acquisition's source pixel size"
+        )
+    downsampling = raw["analysis_downsampling"]
     if not isinstance(downsampling, dict):
         raise ValueError("analysis_downsampling must be a JSON object")
-    unknown_downsampling = set(downsampling) - {"factor", "method"}
-    if unknown_downsampling:
-        raise ValueError(
-            f"Unknown analysis_downsampling settings: {sorted(unknown_downsampling)}"
-        )
-    downsampling = {
-        "factor": downsampling.get("factor", 3),
-        "method": downsampling.get("method", "area_mean"),
-    }
+    if set(downsampling) != {"factor", "method"}:
+        raise ValueError("analysis_downsampling must contain exactly factor and method")
     if (
         isinstance(downsampling["factor"], bool)
         or not isinstance(downsampling["factor"], int)
@@ -1119,6 +1120,12 @@ def print_plan(
             print(
                 "  preprocess: already-stitched IMS -> channel TIFFs -> max projection"
             )
+            print(f"  trim trailing zero padding: {cfg['_trim']}")
+            if cfg["_trim"]:
+                print(
+                    "  WARNING: set trim_zero_padding=false when dark right/bottom "
+                    "edges are real image content rather than IMS storage padding"
+                )
         print(
             "  downstream: stitched-TIFF runner from CellProfiler through final analyses"
         )
