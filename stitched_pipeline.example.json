@@ -19,5 +19,10 @@
     "intensity": {"Mean intensity": {"percentile": 0, "keep": "above"}},
     "shape": {"Area_um2": {"percentile": 0, "keep": "above"}}
   },
-  "reports": {"intensity": true, "shape": true, "colocalization": true}
+  "reports": {
+    "organoid_mask": true,
+    "intensity": true,
+    "shape": true,
+    "colocalization": true
+  }
 }

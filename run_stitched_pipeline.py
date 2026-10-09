@@ -50,6 +50,7 @@ ANALYSIS_FILES = (
     "ROIFiltering/Intensity/intensityfilter.py",
     "ROIFiltering/FinalFilter/filter.py",
     *SHAPE_REPORTS.values(),
+    "QC/organoid_mask_qc.py",
     "Colocalization/colocalizationdapiscript1.py",
     "Colocalization/colocalizationdapiscript2.py",
 )
@@ -57,6 +58,7 @@ ANALYSIS_FILES = (
 EXPECTED_CP_PIPELINE_SETTINGS = (
     "Name the output objects:FilterObjects",
     "Name the output objects:FilterObjects2",
+    "Enter single file name:OrganoidMask",
     "Enter single file name:CellMask",
     "Filename prefix:MyExpt_",
 )
@@ -367,8 +369,12 @@ def read_config(config_file: Path) -> dict:
     ):
         raise ValueError("alignment.extra_args cannot override runner-managed file/calibration arguments")
     reports = raw.get("reports", {})
-    if not isinstance(reports, dict) or set(reports) - {"intensity", "shape", "colocalization"}:
-        raise ValueError("reports may contain only intensity, shape, and colocalization")
+    allowed_reports = {"organoid_mask", "intensity", "shape", "colocalization"}
+    if not isinstance(reports, dict) or set(reports) - allowed_reports:
+        raise ValueError(
+            "reports may contain only organoid_mask, intensity, shape, "
+            "and colocalization"
+        )
     if not all(isinstance(value, bool) for value in reports.values()):
         raise ValueError("Every reports setting must be true or false")
     output_value = raw.get("output_dir")
@@ -494,7 +500,16 @@ class Runner:
                str(ROOT / "CellProfiler/cellprofilerdriver.py"),
                "--pipeline", str(self.cfg["_pipeline"]),
                "--input", str(image), "--output", str(out)]
-        self.execute(label, cmd, [out / "CellMask.tiff", out / "MyExpt_FilterObjects2.csv", out / "MyExpt_FilterObjects.csv"])
+        self.execute(
+            label,
+            cmd,
+            [
+                out / "OrganoidMask.tiff",
+                out / "CellMask.tiff",
+                out / "MyExpt_FilterObjects2.csv",
+                out / "MyExpt_FilterObjects.csv",
+            ],
+        )
 
 
 def ensure_projection(source: Path, destination: Path) -> Path:
@@ -600,6 +615,33 @@ def run(cfg: dict, resume: bool) -> None:
     for name in names:
         aligned_cp[name] = r.out / "03_aligned_segmentation" / name
         r.cp(f"04_aligned_cp_{name}", aligned[name], aligned_cp[name])
+
+    if reports.get("organoid_mask", True):
+        out = r.out / "04_organoid_mask_qc"
+        command = [
+            sys.executable,
+            str(ROOT / "QC/organoid_mask_qc.py"),
+            "--output-dir",
+            str(out),
+        ]
+        for name in names:
+            command.extend(
+                [
+                    "--entry",
+                    name,
+                    str(aligned[name]),
+                    str(aligned_cp[name] / "OrganoidMask.tiff"),
+                    str(aligned_cp[name] / "CellMask.tiff"),
+                ]
+            )
+        r.execute(
+            "04_organoid_mask_qc",
+            command,
+            [
+                out / "organoid_mask_qc.png",
+                out / "organoid_mask_statistics.csv",
+            ],
+        )
 
     extracted: dict[str, Path] = {}
     for name in names:
@@ -725,7 +767,9 @@ def main(argv: list[str] | None = None) -> int:
             print("  01  initial CellProfiler segmentation for registration")
             print("  02  CASTalign each marker to the nuclear reference")
         print("  03  CellProfiler segmentation in the final coordinate frame")
-        print("  04  ROI reconstruction and pixel-coordinate export")
+        if cfg.get("reports", {}).get("organoid_mask", True):
+            print("  04a actual organoid-mask containment QC")
+        print("  04b ROI reconstruction and pixel-coordinate export")
         if cfg.get("reports", {}).get("intensity", True):
             print("  05a intensity QC report")
         print("  05b intensity-only filter pass")

@@ -472,6 +472,7 @@ def read_config(config_path: Path) -> dict[str, Any]:
         "ims_unit",
         "trim_zero_padding",
         "stitching",
+        "analysis_downsampling",
         "analysis",
     }
     unknown = set(raw) - allowed
@@ -520,6 +521,28 @@ def read_config(config_path: Path) -> dict[str, Any]:
     trim = raw.get("trim_zero_padding", True)
     if not isinstance(trim, bool):
         raise ValueError("trim_zero_padding must be true or false")
+    downsampling = raw.get(
+        "analysis_downsampling", {"factor": 3, "method": "area_mean"}
+    )
+    if not isinstance(downsampling, dict):
+        raise ValueError("analysis_downsampling must be a JSON object")
+    unknown_downsampling = set(downsampling) - {"factor", "method"}
+    if unknown_downsampling:
+        raise ValueError(
+            f"Unknown analysis_downsampling settings: {sorted(unknown_downsampling)}"
+        )
+    downsampling = {
+        "factor": downsampling.get("factor", 3),
+        "method": downsampling.get("method", "area_mean"),
+    }
+    if (
+        isinstance(downsampling["factor"], bool)
+        or not isinstance(downsampling["factor"], int)
+        or downsampling["factor"] <= 0
+    ):
+        raise ValueError("analysis_downsampling.factor must be a positive integer")
+    if downsampling["method"] != "area_mean":
+        raise ValueError("analysis_downsampling.method must be area_mean")
     stitching = raw.get("stitching", {})
     if not isinstance(stitching, dict):
         raise ValueError("stitching must be a JSON object")
@@ -587,6 +610,7 @@ def read_config(config_path: Path) -> dict[str, Any]:
     result["_mode"] = mode
     result["_unit"] = unit
     result["_trim"] = trim
+    result["_analysis_downsampling"] = downsampling
     result["_virus_channel"] = virus_channel
     result["_virus_channel_by_sample"] = virus_by_sample
     result["_stitching"] = stitch_defaults
@@ -753,6 +777,101 @@ def projection_paths(
     }
 
 
+def analysis_projection_paths(
+    preprocessing: Path,
+    acquisition: Acquisition,
+    factor: int,
+    actual_order: tuple[str, str, str, str] = CHANNEL_ORDER,
+) -> dict[str, Path]:
+    if factor == 1:
+        return projection_paths(preprocessing, acquisition, actual_order)
+    directory = preprocessing / acquisition.name / "05_analysis_projections"
+    return {
+        channel: directory
+        / (
+            f"{acquisition.name}_{channel}_stitched_max_projection_"
+            f"downsample{factor}.tif"
+        )
+        for channel in actual_order
+    }
+
+
+def area_mean_downsample(
+    image: np.ndarray, factor: int
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Downsample a 2-D image by non-overlapping area means."""
+    if image.ndim != 2:
+        raise ValueError(f"Analysis projection must be 2-D, got shape {image.shape}")
+    if isinstance(factor, bool) or not isinstance(factor, int) or factor <= 0:
+        raise ValueError("Downsampling factor must be a positive integer")
+    source_y, source_x = image.shape
+    output_y, output_x = source_y // factor, source_x // factor
+    if output_y < 1 or output_x < 1:
+        raise ValueError(
+            f"Image shape {image.shape} is smaller than downsampling factor {factor}"
+        )
+    used_y, used_x = output_y * factor, output_x * factor
+    if factor == 1:
+        result = image
+    else:
+        blocks = image[:used_y, :used_x].reshape(output_y, factor, output_x, factor)
+        averaged = blocks.mean(axis=(1, 3), dtype=np.float32)
+        if np.issubdtype(image.dtype, np.integer):
+            limits = np.iinfo(image.dtype)
+            result = np.clip(np.rint(averaged), limits.min, limits.max).astype(
+                image.dtype
+            )
+        else:
+            result = averaged.astype(image.dtype, copy=False)
+    details = {
+        "source_shape_yx": [source_y, source_x],
+        "analysis_shape_yx": [output_y, output_x],
+        "cropped_trailing_pixels_yx": [source_y - used_y, source_x - used_x],
+    }
+    return result, details
+
+
+def prepare_analysis_projections(
+    preprocessing: Path,
+    acquisition: Acquisition,
+    source_outputs: dict[str, Path],
+    factor: int,
+    method: str,
+    actual_order: tuple[str, str, str, str],
+) -> tuple[dict[str, Path], dict[str, Any]]:
+    if method != "area_mean":
+        raise ValueError(f"Unsupported analysis downsampling method: {method}")
+    outputs = analysis_projection_paths(
+        preprocessing, acquisition, factor, actual_order
+    )
+    channel_details: dict[str, Any] = {}
+    for channel in actual_order:
+        source = source_outputs[channel]
+        destination = outputs[channel]
+        image = np.asarray(tifffile.imread(source))
+        downsampled, details = area_mean_downsample(image, factor)
+        if destination != source:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if not destination.is_file() or not destination.stat().st_size:
+                tifffile.imwrite(
+                    destination,
+                    downsampled,
+                    bigtiff=True,
+                    compression="zlib",
+                    metadata={"axes": "YX"},
+                )
+        channel_details[channel] = {
+            "source": str(source),
+            "output": str(destination),
+            **details,
+        }
+    return outputs, {
+        "factor": factor,
+        "method": method,
+        "channels": channel_details,
+    }
+
+
 def export_stitched_ims(
     acquisition: Acquisition,
     preprocessing: Path,
@@ -897,12 +1016,30 @@ def write_metadata(
     preprocessing: Path,
     acquisition: Acquisition,
     metadata: dict[str, Any],
-    outputs: dict[str, Path],
+    source_outputs: dict[str, Path],
+    analysis_outputs: dict[str, Path],
+    downsampling: dict[str, Any],
 ) -> Path:
     destination = preprocessing / acquisition.name / "ims_metadata.json"
     destination.parent.mkdir(parents=True, exist_ok=True)
     payload = dict(metadata)
-    payload["projection_tiffs"] = {name: str(path) for name, path in outputs.items()}
+    payload["projection_tiffs"] = {
+        name: str(path) for name, path in source_outputs.items()
+    }
+    payload["analysis_projection_tiffs"] = {
+        name: str(path) for name, path in analysis_outputs.items()
+    }
+    payload["analysis_downsampling"] = {
+        **downsampling,
+        "source_pixel_size_um": {
+            "x": metadata["voxel_size_um"]["x"],
+            "y": metadata["voxel_size_um"]["y"],
+        },
+        "effective_pixel_size_um": {
+            "x": metadata["voxel_size_um"]["x"] * downsampling["factor"],
+            "y": metadata["voxel_size_um"]["y"] * downsampling["factor"],
+        },
+    }
     destination.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -917,14 +1054,15 @@ def downstream_config(
 ) -> dict[str, Any]:
     actual_order = tuple(metadata["fixed_channel_order"])
     result = analysis_for_virus(cfg["_analysis"], metadata["virus_channel"])
+    factor = cfg["_analysis_downsampling"]["factor"]
     result.update(
         {
             "nuclear_channel": "Hoechst",
             "channels": {name: str(outputs[name]) for name in actual_order},
             "output_dir": str(cfg["_output"] / "analysis" / acquisition.name),
             "pixel_size_um": {
-                "x": metadata["voxel_size_um"]["x"],
-                "y": metadata["voxel_size_um"]["y"],
+                "x": metadata["voxel_size_um"]["x"] * factor,
+                "y": metadata["voxel_size_um"]["y"] * factor,
             },
         }
     )
@@ -948,6 +1086,14 @@ def print_plan(
             f"\n{acquisition.name}: mode={acquisition.mode}, files={len(acquisition.files)}"
         )
         print(f"  voxel size (um): {info['voxel_size_um']}")
+        downsampling = cfg["_analysis_downsampling"]
+        print(
+            "  analysis projection: "
+            f"{downsampling['factor']}x XY {downsampling['method']}; "
+            "effective pixel size (um): "
+            f"x={info['voxel_size_um']['x'] * downsampling['factor']}, "
+            f"y={info['voxel_size_um']['y'] * downsampling['factor']}"
+        )
         first_channels = info["files"][0]["channels"]
         for channel in first_channels:
             wavelength = (
@@ -999,18 +1145,33 @@ def run(
     outputs_by_sample: dict[str, dict[str, Path]] = {}
     for acquisition in acquisitions:
         actual_order = tuple(metadata[acquisition.name]["fixed_channel_order"])
-        outputs = projection_paths(preprocessing, acquisition, actual_order)
+        source_outputs = projection_paths(preprocessing, acquisition, actual_order)
         if acquisition.mode == "stitched":
-            outputs = export_stitched_ims(
+            source_outputs = export_stitched_ims(
                 acquisition, preprocessing, cfg["_trim"], actual_order
             )
+        downsampling = cfg["_analysis_downsampling"]
+        analysis_outputs, downsampling_metadata = prepare_analysis_projections(
+            preprocessing,
+            acquisition,
+            source_outputs,
+            downsampling["factor"],
+            downsampling["method"],
+            actual_order,
+        )
         metadata_path = write_metadata(
-            preprocessing, acquisition, metadata[acquisition.name], outputs
+            preprocessing,
+            acquisition,
+            metadata[acquisition.name],
+            source_outputs,
+            analysis_outputs,
+            downsampling_metadata,
         )
         state.record(
-            f"preprocess_{acquisition.name}", [*outputs.values(), metadata_path]
+            f"preprocess_{acquisition.name}",
+            [*source_outputs.values(), *analysis_outputs.values(), metadata_path],
         )
-        outputs_by_sample[acquisition.name] = outputs
+        outputs_by_sample[acquisition.name] = analysis_outputs
 
     config_dir = state.output / "generated_configs"
     config_dir.mkdir(parents=True, exist_ok=True)
