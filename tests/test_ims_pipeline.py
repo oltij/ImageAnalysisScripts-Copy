@@ -13,12 +13,14 @@ import tifffile
 import run_ims_pipeline as ims
 
 
-def create_synthetic_ims(path, channel_count=4, shape=(3, 6, 7)):
+def create_synthetic_ims(
+    path, channel_count=4, shape=(3, 6, 7), virus_name="BiVe3 virus"
+):
     wavelengths = [405.0, 488.0, 561.0, 640.0]
     names = [
         "Confocal - Blue",
         "Confocal - Green",
-        "Confocal - Red",
+        virus_name,
         "Confocal - Far Red",
     ]
     with h5py.File(path, "w") as handle:
@@ -66,19 +68,29 @@ class IMSPipelineTests(unittest.TestCase):
                 "conda_executable": "conda",
             },
             "alignment": {"enabled": False, "extra_args": []},
-            "pairs": [["mNeonGreen", "BiVe3"]],
+            "pairs": [["mNeonGreen", "Virus"]],
             "thresholds": {"marker_nuclear": 0.25, "marker_marker": 0.25},
             "filters": {"intensity": {}, "shape": {}},
             "reports": {"intensity": False, "shape": False, "colocalization": False},
         }
 
-    def _write_config(self, directory, source, output="output", mode="auto"):
+    def _write_config(
+        self,
+        directory,
+        source,
+        output="output",
+        mode="auto",
+        virus_channel="auto",
+        virus_channel_by_sample=None,
+    ):
         config = {
             "ims_input": str(source),
             "input_mode": mode,
             "output_dir": output,
             "fiji_sif": None,
-            "channel_order": list(ims.CHANNEL_ORDER),
+            "channel_order": list(ims.CHANNEL_TEMPLATE),
+            "virus_channel": virus_channel,
+            "virus_channel_by_sample": virus_channel_by_sample or {},
             "ims_unit": "um",
             "trim_zero_padding": True,
             "stitching": {"grid": [2, 2]},
@@ -102,7 +114,7 @@ class IMSPipelineTests(unittest.TestCase):
                 [
                     "Confocal - Blue",
                     "Confocal - Green",
-                    "Confocal - Red",
+                    "BiVe3 virus",
                     "Confocal - Far Red",
                 ],
             )
@@ -115,6 +127,54 @@ class IMSPipelineTests(unittest.TestCase):
             create_synthetic_ims(source, channel_count=3)
             with self.assertRaisesRegex(ValueError, "requires exactly 4"):
                 ims.inspect_ims(source, "um")
+
+    def test_bive4_is_detected_and_used_in_downstream_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            source = tmp / "OrganoidB.ims"
+            create_synthetic_ims(source, virus_name="BiVe4 virus")
+            cfg = ims.read_config(self._write_config(tmp, source))
+            acquisition = ims.discover_acquisitions(source, "auto")[0]
+            virus = ims.resolve_virus_channel(cfg, acquisition)
+            self.assertEqual(virus, "BiVe4")
+            metadata = ims.inspect_acquisition(acquisition, "um", virus)
+            actual_order = ims.channel_order(virus)
+            outputs = ims.projection_paths(
+                tmp / "preprocessing", acquisition, actual_order
+            )
+            generated = ims.downstream_config(cfg, acquisition, metadata, outputs)
+            self.assertEqual(list(generated["channels"]), list(actual_order))
+            self.assertEqual(generated["pairs"], [["mNeonGreen", "BiVe4"]])
+
+    def test_bive4_can_be_detected_from_underscore_delimited_filename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            source = tmp / "Organoid_BiVe4_01.ims"
+            create_synthetic_ims(source, virus_name="Confocal - Red")
+            cfg = ims.read_config(self._write_config(tmp, source))
+            acquisition = ims.discover_acquisitions(source, "auto")[0]
+            self.assertEqual(ims.resolve_virus_channel(cfg, acquisition), "BiVe4")
+
+    def test_ambiguous_virus_can_be_overridden_per_sample(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            source = tmp / "OrganoidB.ims"
+            create_synthetic_ims(source, virus_name="Confocal - Red")
+            acquisition = ims.discover_acquisitions(source, "auto")[0]
+            auto_cfg = ims.read_config(self._write_config(tmp, source))
+            with self.assertRaisesRegex(ValueError, "could not determine"):
+                ims.resolve_virus_channel(auto_cfg, acquisition)
+
+            override_cfg = ims.read_config(
+                self._write_config(
+                    tmp,
+                    source,
+                    virus_channel_by_sample={"OrganoidB": "BiVe4"},
+                )
+            )
+            self.assertEqual(
+                ims.resolve_virus_channel(override_cfg, acquisition), "BiVe4"
+            )
 
     def test_single_mosaic_field_discovers_all_siblings(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -208,7 +268,10 @@ class IMSPipelineTests(unittest.TestCase):
             raw["fiji_sif"] = str(tmp / "fiji.sif")
             config_path.write_text(json.dumps(raw), encoding="utf-8")
             cfg = ims.read_config(config_path)
-            command = ims.mosaic_command(cfg, tmp / "preprocessing")
+            acquisition = ims.discover_acquisitions(source, "auto")[0]
+            command = ims.mosaic_command(
+                cfg, tmp / "preprocessing", acquisition, ims.CHANNEL_ORDER
+            )
             index = command.index("--channel-names")
             self.assertEqual(command[index + 1 : index + 5], list(ims.CHANNEL_ORDER))
             self.assertIn("--output-root", command)

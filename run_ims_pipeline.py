@@ -2,7 +2,7 @@
 """Run the complete image-analysis workflow directly from Imaris IMS files.
 
 IMS channel indices are assigned in the user-specified fixed wavelength order:
-0=Hoechst, 1=mNeonGreen, 2=BiVe3 virus, 3=PV. Mosaic fields are passed
+0=Hoechst, 1=mNeonGreen, 2=BiVe3 or BiVe4 virus, 3=PV. Mosaic fields are passed
 through the existing BaSiC/BigStitcher workflow; an already-stitched IMS file
 is exported and max-projected directly. The resulting channel TIFFs and IMS XY
 calibration are then passed to run_stitched_pipeline.py.
@@ -40,11 +40,18 @@ except ImportError:
 ROOT = Path(__file__).resolve().parent
 IMS_MOSAIC_SCRIPT = ROOT / "Stitching/IMSTIFF_trim_zero_padding.py"
 FIELD_RE = re.compile(r"^(?P<sample>.+)_F(?P<field>\d{2})\.ims$", re.IGNORECASE)
+VIRUS_RE = re.compile(
+    r"(?<![A-Za-z0-9])bive[\s_-]*([34])(?=$|[^A-Za-z0-9])", re.IGNORECASE
+)
+CHANNEL_TEMPLATE = ("Hoechst", "mNeonGreen", "Virus", "PV")
+VIRUS_CHANNELS = ("BiVe3", "BiVe4")
+# Retained as the original/default concrete order for callers that import this module.
 CHANNEL_ORDER = ("Hoechst", "mNeonGreen", "BiVe3", "PV")
 CHANNEL_DISPLAY_NAMES = {
     "Hoechst": "Hoechst",
     "mNeonGreen": "mNeonGreen",
     "BiVe3": "BiVe3 virus",
+    "BiVe4": "BiVe4 virus",
     "PV": "PV",
 }
 UNIT_TO_UM = {
@@ -63,6 +70,14 @@ class Acquisition:
     name: str
     mode: str
     files: tuple[Path, ...]
+
+
+def channel_order(virus_channel: str) -> tuple[str, str, str, str]:
+    if virus_channel not in VIRUS_CHANNELS:
+        raise ValueError(
+            f"Virus channel must be one of {list(VIRUS_CHANNELS)}, got {virus_channel!r}"
+        )
+    return ("Hoechst", "mNeonGreen", virus_channel, "PV")
 
 
 def utc_now() -> str:
@@ -254,7 +269,52 @@ def wavelength_from_attributes(
     return None, None
 
 
-def inspect_ims(source: Path, fallback_unit: str) -> dict[str, Any]:
+def virus_names_in_text(value: Any) -> set[str]:
+    return {f"BiVe{match}" for match in VIRUS_RE.findall(str(value))}
+
+
+def detect_virus_channel(acquisition: Acquisition) -> str:
+    """Identify channel 2 as BiVe3 or BiVe4 from IMS metadata/name evidence."""
+    detected = virus_names_in_text(acquisition.name)
+    for source in acquisition.files:
+        detected.update(virus_names_in_text(source.stem))
+        try:
+            handle_context = h5py.File(source, "r")
+        except OSError as exc:
+            raise ValueError(f"Could not open IMS file {source}: {exc}") from exc
+        with handle_context as handle:
+            info_path = "DataSetInfo/Channel 2"
+            if info_path in handle:
+                for value in handle[info_path].attrs.values():
+                    detected.update(virus_names_in_text(decode_attribute(value)))
+    if len(detected) == 1:
+        return detected.pop()
+    if len(detected) > 1:
+        raise ValueError(
+            f"{acquisition.name}: IMS names/metadata mention both BiVe3 and BiVe4. "
+            "Set virus_channel_by_sample explicitly."
+        )
+    raise ValueError(
+        f"{acquisition.name}: could not determine whether IMS channel 2 is BiVe3 or "
+        "BiVe4 from the sample name or Imaris channel metadata. Set virus_channel "
+        "or virus_channel_by_sample explicitly."
+    )
+
+
+def resolve_virus_channel(cfg: dict[str, Any], acquisition: Acquisition) -> str:
+    override = cfg["_virus_channel_by_sample"].get(acquisition.name)
+    if override:
+        return override
+    configured = cfg["_virus_channel"]
+    if configured != "auto":
+        return configured
+    return detect_virus_channel(acquisition)
+
+
+def inspect_ims(
+    source: Path, fallback_unit: str, virus_channel: str = "BiVe3"
+) -> dict[str, Any]:
+    actual_order = channel_order(virus_channel)
     try:
         handle_context = h5py.File(source, "r")
     except OSError as exc:
@@ -263,14 +323,15 @@ def inspect_ims(source: Path, fallback_unit: str) -> dict[str, Any]:
         channel_root, resolution, timepoint, channel_keys = first_resolution_timepoint(
             handle
         )
-        if len(channel_keys) != len(CHANNEL_ORDER):
+        if len(channel_keys) != len(CHANNEL_TEMPLATE):
             raise ValueError(
                 f"{source.name} has {len(channel_keys)} channels; this workflow requires exactly "
-                f"{len(CHANNEL_ORDER)} in the fixed order {list(CHANNEL_ORDER)}"
+                f"{len(CHANNEL_TEMPLATE)} in the fixed order "
+                "['Hoechst', 'mNeonGreen', 'BiVe3 or BiVe4', 'PV']"
             )
         voxel_size = voxel_size_from_handle(handle, fallback_unit)
         channels = []
-        for index, (key, canonical) in enumerate(zip(channel_keys, CHANNEL_ORDER)):
+        for index, (key, canonical) in enumerate(zip(channel_keys, actual_order)):
             dataset = channel_root[key]["Data"]
             if dataset.ndim != 3:
                 raise ValueError(
@@ -322,8 +383,13 @@ def inspect_ims(source: Path, fallback_unit: str) -> dict[str, Any]:
         }
 
 
-def inspect_acquisition(acquisition: Acquisition, fallback_unit: str) -> dict[str, Any]:
-    files = [inspect_ims(path, fallback_unit) for path in acquisition.files]
+def inspect_acquisition(
+    acquisition: Acquisition, fallback_unit: str, virus_channel: str = "BiVe3"
+) -> dict[str, Any]:
+    actual_order = channel_order(virus_channel)
+    files = [
+        inspect_ims(path, fallback_unit, virus_channel) for path in acquisition.files
+    ]
     first = files[0]
     first_voxel = np.array(list(first["voxel_size_um"].values()), dtype=float)
     first_shapes = [channel["shape_zyx"] for channel in first["channels"]]
@@ -343,10 +409,28 @@ def inspect_acquisition(acquisition: Acquisition, fallback_unit: str) -> dict[st
         "sample": acquisition.name,
         "mode": acquisition.mode,
         "channel_assignment_basis": "zero-based IMS channel index in declared ascending wavelength order",
-        "fixed_channel_order": list(CHANNEL_ORDER),
+        "fixed_channel_order": list(actual_order),
+        "virus_channel": virus_channel,
         "voxel_size_um": first["voxel_size_um"],
         "files": files,
     }
+
+
+def analysis_for_virus(settings: dict[str, Any], virus_channel: str) -> dict[str, Any]:
+    """Resolve Virus/BiVe3/BiVe4 pair entries to this acquisition's virus."""
+    result = json.loads(json.dumps(settings))
+    pairs = result.get("pairs")
+    if isinstance(pairs, list):
+        result["pairs"] = [
+            [
+                virus_channel if name in {"Virus", "{virus}", *VIRUS_CHANNELS} else name
+                for name in pair
+            ]
+            if isinstance(pair, list)
+            else pair
+            for pair in pairs
+        ]
+    return result
 
 
 def validate_analysis_settings(settings: dict[str, Any]) -> None:
@@ -358,7 +442,7 @@ def validate_analysis_settings(settings: dict[str, Any]) -> None:
             "analysis cannot override IMS-derived settings: "
             + ", ".join(sorted(reserved.intersection(settings)))
         )
-    prototype = dict(settings)
+    prototype = analysis_for_virus(settings, "BiVe3")
     prototype.update(
         {
             "nuclear_channel": "Hoechst",
@@ -383,6 +467,8 @@ def read_config(config_path: Path) -> dict[str, Any]:
         "output_dir",
         "fiji_sif",
         "channel_order",
+        "virus_channel",
+        "virus_channel_by_sample",
         "ims_unit",
         "trim_zero_padding",
         "stitching",
@@ -391,9 +477,33 @@ def read_config(config_path: Path) -> dict[str, Any]:
     unknown = set(raw) - allowed
     if unknown:
         raise ValueError(f"Unknown IMS configuration settings: {sorted(unknown)}")
-    if raw.get("channel_order", list(CHANNEL_ORDER)) != list(CHANNEL_ORDER):
+    configured_order = raw.get("channel_order", list(CHANNEL_TEMPLATE))
+    valid_orders = [
+        list(CHANNEL_TEMPLATE),
+        *(list(channel_order(v)) for v in VIRUS_CHANNELS),
+    ]
+    if configured_order not in valid_orders:
         raise ValueError(
-            f"channel_order must be exactly {list(CHANNEL_ORDER)} for this workflow"
+            "channel_order must be ['Hoechst', 'mNeonGreen', 'Virus', 'PV'] "
+            "(or use BiVe3/BiVe4 in the third position for a single-virus batch)"
+        )
+    legacy_virus = (
+        configured_order[2] if configured_order[2] in VIRUS_CHANNELS else None
+    )
+    virus_channel = raw.get("virus_channel", legacy_virus or "auto")
+    if virus_channel not in {"auto", *VIRUS_CHANNELS}:
+        raise ValueError("virus_channel must be auto, BiVe3, or BiVe4")
+    if legacy_virus and virus_channel not in {"auto", legacy_virus}:
+        raise ValueError("channel_order and virus_channel specify different viruses")
+    if legacy_virus and virus_channel == "auto":
+        virus_channel = legacy_virus
+    virus_by_sample = raw.get("virus_channel_by_sample", {})
+    if not isinstance(virus_by_sample, dict) or any(
+        not isinstance(sample, str) or not sample.strip() or virus not in VIRUS_CHANNELS
+        for sample, virus in virus_by_sample.items()
+    ):
+        raise ValueError(
+            "virus_channel_by_sample must map nonempty sample names to BiVe3 or BiVe4"
         )
     input_value = raw.get("ims_input")
     output_value = raw.get("output_dir")
@@ -477,6 +587,8 @@ def read_config(config_path: Path) -> dict[str, Any]:
     result["_mode"] = mode
     result["_unit"] = unit
     result["_trim"] = trim
+    result["_virus_channel"] = virus_channel
+    result["_virus_channel_by_sample"] = virus_by_sample
     result["_stitching"] = stitch_defaults
     result["_analysis"] = analysis
     result["_fiji_sif"] = (
@@ -629,11 +741,15 @@ def trailing_zero_padding_xy(stack: h5py.Dataset, z_count: int) -> tuple[int, in
     )
 
 
-def projection_paths(preprocessing: Path, acquisition: Acquisition) -> dict[str, Path]:
+def projection_paths(
+    preprocessing: Path,
+    acquisition: Acquisition,
+    actual_order: tuple[str, str, str, str] = CHANNEL_ORDER,
+) -> dict[str, Path]:
     directory = preprocessing / acquisition.name / "04_max_projections"
     return {
         channel: directory / f"{acquisition.name}_{channel}_stitched_max_projection.tif"
-        for channel in CHANNEL_ORDER
+        for channel in actual_order
     }
 
 
@@ -641,6 +757,7 @@ def export_stitched_ims(
     acquisition: Acquisition,
     preprocessing: Path,
     trim_zero_padding: bool,
+    actual_order: tuple[str, str, str, str] = CHANNEL_ORDER,
 ) -> dict[str, Path]:
     source = acquisition.files[0]
     acquisition_dir = preprocessing / acquisition.name
@@ -648,11 +765,11 @@ def export_stitched_ims(
     projections = acquisition_dir / "04_max_projections"
     exported.mkdir(parents=True, exist_ok=True)
     projections.mkdir(parents=True, exist_ok=True)
-    outputs = projection_paths(preprocessing, acquisition)
+    outputs = projection_paths(preprocessing, acquisition, actual_order)
 
     with h5py.File(source, "r") as handle:
         channel_root, _, _, channel_keys = first_resolution_timepoint(handle)
-        if len(channel_keys) != len(CHANNEL_ORDER):
+        if len(channel_keys) != len(CHANNEL_TEMPLATE):
             raise ValueError(
                 f"{source.name} does not contain the required four channels"
             )
@@ -671,7 +788,7 @@ def export_stitched_ims(
             f"Trimmed trailing columns: {source_x - valid_x}\n",
             encoding="utf-8",
         )
-        for channel_key, canonical in zip(channel_keys, CHANNEL_ORDER):
+        for channel_key, canonical in zip(channel_keys, actual_order):
             stack_path = exported / f"{canonical}.tif"
             projection_path = outputs[canonical]
             if (
@@ -702,18 +819,23 @@ def export_stitched_ims(
     return outputs
 
 
-def mosaic_command(cfg: dict[str, Any], preprocessing: Path) -> list[str]:
+def mosaic_command(
+    cfg: dict[str, Any],
+    preprocessing: Path,
+    acquisition: Acquisition,
+    actual_order: tuple[str, str, str, str],
+) -> list[str]:
     stitch = cfg["_stitching"]
     command = [
         sys.executable,
         str(IMS_MOSAIC_SCRIPT),
-        str(cfg["_input"]),
+        str(acquisition.files[0]),
         "--fiji-sif",
         str(cfg["_fiji_sif"]),
         "--output-root",
         str(preprocessing),
         "--channel-names",
-        *CHANNEL_ORDER,
+        *actual_order,
         "--grid",
         *(str(value) for value in stitch["grid"]),
         "--overlap",
@@ -793,11 +915,12 @@ def downstream_config(
     metadata: dict[str, Any],
     outputs: dict[str, Path],
 ) -> dict[str, Any]:
-    result = dict(cfg["_analysis"])
+    actual_order = tuple(metadata["fixed_channel_order"])
+    result = analysis_for_virus(cfg["_analysis"], metadata["virus_channel"])
     result.update(
         {
             "nuclear_channel": "Hoechst",
-            "channels": {name: str(outputs[name]) for name in CHANNEL_ORDER},
+            "channels": {name: str(outputs[name]) for name in actual_order},
             "output_dir": str(cfg["_output"] / "analysis" / acquisition.name),
             "pixel_size_um": {
                 "x": metadata["voxel_size_um"]["x"],
@@ -815,10 +938,10 @@ def print_plan(
 ) -> None:
     print("IMS preflight: OK")
     print("Fixed channel mapping by ascending-wavelength index:")
-    for index, channel in enumerate(CHANNEL_ORDER):
-        print(
-            f"  {index}: {CHANNEL_DISPLAY_NAMES[channel]} -> downstream name {channel}"
-        )
+    print("  0: Hoechst")
+    print("  1: mNeonGreen")
+    print("  2: BiVe3 virus or BiVe4 virus (resolved per organoid)")
+    print("  3: PV")
     for acquisition in acquisitions:
         info = metadata[acquisition.name]
         print(
@@ -866,14 +989,21 @@ def run(
     validate_runtime(cfg, bool(mosaic_acquisitions))
     state = IMSRun(cfg, acquisitions, resume)
     preprocessing = state.output / "preprocessing"
-    if mosaic_acquisitions:
-        state.execute("IMS mosaic preprocessing", mosaic_command(cfg, preprocessing))
+    for acquisition in mosaic_acquisitions:
+        actual_order = tuple(metadata[acquisition.name]["fixed_channel_order"])
+        state.execute(
+            f"IMS mosaic preprocessing {acquisition.name}",
+            mosaic_command(cfg, preprocessing, acquisition, actual_order),
+        )
 
     outputs_by_sample: dict[str, dict[str, Path]] = {}
     for acquisition in acquisitions:
-        outputs = projection_paths(preprocessing, acquisition)
+        actual_order = tuple(metadata[acquisition.name]["fixed_channel_order"])
+        outputs = projection_paths(preprocessing, acquisition, actual_order)
         if acquisition.mode == "stitched":
-            outputs = export_stitched_ims(acquisition, preprocessing, cfg["_trim"])
+            outputs = export_stitched_ims(
+                acquisition, preprocessing, cfg["_trim"], actual_order
+            )
         metadata_path = write_metadata(
             preprocessing, acquisition, metadata[acquisition.name], outputs
         )
@@ -952,7 +1082,11 @@ def main(argv: list[str] | None = None) -> int:
                     f"F{expected_tiles - 1:02d}; found {field_numbers}"
                 )
     metadata = {
-        acquisition.name: inspect_acquisition(acquisition, cfg["_unit"])
+        acquisition.name: inspect_acquisition(
+            acquisition,
+            cfg["_unit"],
+            resolve_virus_channel(cfg, acquisition),
+        )
         for acquisition in acquisitions
     }
     print_plan(cfg, acquisitions, metadata)
