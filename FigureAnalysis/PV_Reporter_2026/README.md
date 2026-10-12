@@ -49,5 +49,3 @@ retained for reproducibility.
 Use pv_panelA_kw_corrected/ for the final Panel A statistical figures.
 
 The Kruskal–Wallis tests do not adjust for experimental batch.
-Acquisition counts should not be interpreted as independent
-biological replicate counts without verification.
