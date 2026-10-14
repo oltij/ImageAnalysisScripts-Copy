@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "name": "IGF production 94 fields",
+  "input_root": "/nfs/turbo/umms-parent/andor_microscope_data_dump",
+  "sessions": [
+    {
+      "name": "Olti_06_23_2026",
+      "complete_fields": 12
+    },
+    {
+      "name": "Olti_06_25_2026",
+      "complete_fields": 8
+    },
+    {
+      "name": "Olti_06_29_2026",
+      "complete_fields": 7
+    },
+    {
+      "name": "Olti_06_30_2026",
+      "complete_fields": 6
+    },
+    {
+      "name": "Olti_06_30_2026-secondslide",
+      "complete_fields": 6
+    },
+    {
+      "name": "Olti_07_01_2026",
+      "complete_fields": 6
+    },
+    {
+      "name": "Olti_07_02_2026",
+      "complete_fields": 15
+    },
+    {
+      "name": "Olti_07_03_2026",
+      "complete_fields": 6
+    },
+    {
+      "name": "Olti_07_06_2026",
+      "complete_fields": 6
+    },
+    {
+      "name": "Olti_07_08_2026",
+      "complete_fields": 7
+    },
+    {
+      "name": "Olti_07_17_2026",
+      "complete_fields": 7
+    },
+    {
+      "name": "Olti_07_24_2026",
+      "complete_fields": 8
+    }
+  ],
+  "expected": {
+    "complete_fields": 94,
+    "incomplete_fields": 19,
+    "original_tiles": 376,
+    "physical_channels_per_tile": 4,
+    "biological_channels": [
+      "DAPI",
+      "GFP",
+      "LHX6",
+      "PV"
+    ]
+  },
+  "configuration": {
+    "filename": "ims_mge_generic.example.json",
+    "sha256": "55b2633bb6b4d99cbf86d1f02d3aaa65ce0e530741532146aac9c1cd236937db"
+  }
+}

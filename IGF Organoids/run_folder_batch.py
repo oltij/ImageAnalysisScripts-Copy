@@ -24,11 +24,14 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 FIELD_DIR = re.compile(r"^(?:(?P<base>.+?)[_\s-]+)?Field[_\s-]*(?P<num>\d+)$", re.I)
 TILE_TOKEN = re.compile(r"(?:^|[_\s-])F[_\s-]?(\d{1,3})$", re.I)
+SET_TOKEN = re.compile(r"^Set(?P<num>\d+)$", re.I)
+SESSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 IGNORE_NAMES = {".git", "__pycache__", "generated_configs", "preprocessing", "analysis", "output", "outputs", "logs", "input_staging", "inputs", "results", "00_max_projections", "01_exported", "02_basic_corrected", "03_stitched", "04_max_projections", "05_analysis_projections"}
 CHANNEL = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 VALID_PROFILES = {"generic", "reporter"}
@@ -128,8 +131,36 @@ def channel_suffix(filename: str, markers: list[str] | tuple[str, ...]) -> list[
     return out[::-1]
 
 
-def ims_channel_count(source: Path) -> int | None:
-    """Read just the channel-group count, without loading any image pixels.
+def decode_ims_attribute(value: Any) -> str:
+    """Decode a small Imaris metadata attribute without importing image code."""
+    if hasattr(value, 'item') and not hasattr(value, 'shape'):
+        return decode_ims_attribute(value.item())
+    if isinstance(value, bytes):
+        return value.decode('utf-8', errors='replace').rstrip('\x00')
+    dtype = getattr(value, 'dtype', None)
+    if dtype is not None and hasattr(value, 'reshape'):
+        flattened = value.reshape(-1)
+        if dtype.kind == 'S':
+            return b''.join(flattened.tolist()).decode(
+                'utf-8', errors='replace'
+            ).rstrip('\x00')
+        if dtype.kind == 'U':
+            return ''.join(flattened.tolist()).rstrip('\x00')
+        if dtype.kind in {'u', 'i'} and dtype.itemsize == 1:
+            decoded = value.tobytes().decode('utf-8', errors='replace').rstrip('\x00')
+            if decoded and all(char.isprintable() or char.isspace() for char in decoded):
+                return decoded
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        if len(value) == 1:
+            return decode_ims_attribute(value[0])
+        return ' '.join(decode_ims_attribute(item) for item in value)
+    return str(value)
+
+
+@lru_cache(maxsize=None)
+def ims_channel_metadata(source: Path) -> dict[str, Any]:
+    """Read physical channel indices and names without loading image pixels.
 
     Metadata detection requires h5py, which is present in the ims-mosaic Conda
     environment. Without it, rely on the suffix vocabulary or explicit names;
@@ -138,20 +169,35 @@ def ims_channel_count(source: Path) -> int | None:
     try:
         import h5py
     except ImportError:
-        return None
+        return {'count': None, 'indices': None, 'names': None}
     try:
         with h5py.File(source,'r') as handle:
             resolutions = handle['DataSet']
             res = next(iter(sorted(resolutions, key=lambda name: int(name.rsplit(' ',1)[-1]))))
             timepoints = resolutions[res]
             timepoint = next(iter(sorted(timepoints,key=lambda name: int(name.rsplit(' ',1)[-1]))))
-            return len(timepoints[timepoint])
-    except (OSError, KeyError, ValueError, StopIteration) as exc:
+            channel_keys = sorted(
+                timepoints[timepoint],
+                key=lambda name: int(name.rsplit(' ', 1)[-1]),
+            )
+            indices = [int(name.rsplit(' ', 1)[-1]) for name in channel_keys]
+            names = []
+            for index in indices:
+                info = handle.get(f'DataSetInfo/Channel {index}')
+                raw = info.attrs.get('Name', '') if info is not None else ''
+                names.append(decode_ims_attribute(raw).strip())
+            return {'count': len(channel_keys), 'indices': indices, 'names': names}
+    except (OSError, KeyError, TypeError, ValueError, StopIteration) as exc:
         # The full scientific preflight always validates real HDF5. A dry
         # filesystem test or incomplete source can still be scanned; refuse
         # execution at the metadata preflight rather than guessing the count.
-        print(f'WARNING: cannot read IMS channel count from {source}: {exc}',flush=True)
-        return None
+        print(f'WARNING: cannot read IMS channel metadata from {source}: {exc}',flush=True)
+        return {'count': None, 'indices': None, 'names': None}
+
+
+def ims_channel_count(source: Path) -> int | None:
+    """Backward-compatible channel-count accessor."""
+    return ims_channel_metadata(source)['count']
 
 
 def channels_from_filename(filename: str, markers: list[str] | tuple[str,...],
@@ -166,6 +212,12 @@ def channels_from_filename(filename: str, markers: list[str] | tuple[str,...],
             return known
         fail(f'Cannot determine channel labels in {filename!r}; use an explicit '
              'channel_names list or add marker names to filename_markers')
+    if known:
+        fail(
+            f'{filename!r}: IMS contains {count} physical channels but the filename '
+            f'describes {len(known)} biological markers {known}. Unsupported additional '
+            'channels (including phase) must not be assigned biological names.'
+        )
     if count < 1 or count > 12:
         fail(f'Unexpected IMS channel count {count} for {filename!r}')
     stem = Path(filename).stem
@@ -188,6 +240,7 @@ def channels_from_filename(filename: str, markers: list[str] | tuple[str,...],
         fail(f'{filename!r}: fewer than {count} possible channel-name tokens')
     suffix = tokens[-count:]
     if any(not CHANNEL.fullmatch(name) or name.isdecimal() or name.casefold()=='field'
+           or SET_TOKEN.fullmatch(name)
            for name in suffix):
         fail(f'{filename!r}: the {count}-channel IMS metadata does not unambiguously '
              f'match filename tokens {suffix}; add names to filename_markers '
@@ -227,6 +280,24 @@ def optional_acquisition_identifier(
     return None if numeric_is_marker else int(tokens[-1])
 
 
+def experimental_set_identifier(value: str, *, filename: bool) -> int | None:
+    """Extract `SetN` experiment metadata without treating it as a marker."""
+    stem = Path(value).stem if filename else value
+    if filename:
+        ending = TILE_TOKEN.search(stem)
+        if ending is None:
+            fail(f'Cannot find final FNN tile token in IMS filename {value!r}')
+        stem = stem[:ending.start()]
+    matches = [
+        int(match.group('num'))
+        for token in re.split(r'[_\s-]+', stem)
+        if (match := SET_TOKEN.fullmatch(token))
+    ]
+    if len(set(matches)) > 1:
+        fail(f'Conflicting experimental Set identifiers in {value!r}: {matches}')
+    return matches[0] if matches else None
+
+
 def validate_acquisition_identifiers(
     field: 'Field', markers: list[str] | tuple[str, ...]
 ) -> int | None:
@@ -253,9 +324,72 @@ def validate_acquisition_identifiers(
     return directory_id
 
 
+def validate_experimental_set_identifiers(field: 'Field') -> int | None:
+    """Return one consistent SetN identifier from directory and tile names."""
+    identifiers = [experimental_set_identifier(field.group, filename=False)]
+    identifiers.extend(
+        experimental_set_identifier(tile.path.name, filename=True)
+        for tile in field.tiles
+    )
+    present = {identifier for identifier in identifiers if identifier is not None}
+    if len(present) > 1:
+        fail(
+            f'Experimental Set identifier mismatch in {field.path}: '
+            f'directory/files={identifiers}'
+        )
+    return next(iter(present)) if present else None
+
+
+def validate_physical_channel_layout(
+    field: 'Field', *, expected_count: int | None = None,
+    require_metadata: bool = False,
+) -> dict[str, Any]:
+    """Reject cross-tile inconsistencies and unsupported phase channels."""
+    metadata = [ims_channel_metadata(tile.path) for tile in field.tiles]
+    if require_metadata and any(item['count'] is None for item in metadata):
+        fail(f'{field.path}: physical IMS channel metadata could not be read for every tile')
+    known = [item for item in metadata if item['count'] is not None]
+    if not known:
+        return {'count': None, 'indices': None, 'names': None}
+    reference = known[0]
+    for tile, item in zip(field.tiles, metadata):
+        if item['count'] is None:
+            continue
+        if item != reference:
+            fail(
+                f'Physical channel metadata mismatch across tiles in {field.path}: '
+                f'F{field.tiles[0].index:02d}={reference}, F{tile.index:02d}={item}'
+            )
+    if reference['indices'] != list(range(reference['count'])):
+        fail(
+            f'{field.path}: physical IMS channel indices must be sequential from zero; '
+            f'found {reference["indices"]}'
+        )
+    if require_metadata and any(not name for name in reference['names']):
+        fail(
+            f'{field.path}: physical channel names are missing; production validation '
+            'cannot safely exclude an unsupported phase channel'
+        )
+    phase = [name for name in reference['names'] if 'phase' in name.casefold()]
+    if phase:
+        fail(
+            f'{field.path}: unsupported physical phase channel(s) {phase}; '
+            'phase-plus-fluorescence IMS export is intentionally not implemented'
+        )
+    if expected_count is not None and reference['count'] != expected_count:
+        fail(
+            f'{field.path}: IMS contains {reference["count"]} physical channels but '
+            f'{expected_count} biological markers are configured. Unsupported additional '
+            'channels must be rejected before processing.'
+        )
+    return reference
+
+
 def detect_field_channels(field: 'Field', markers: list[str] | tuple[str, ...]) -> list[str]:
     validate_acquisition_identifiers(field, markers)
-    count = ims_channel_count(field.tiles[0].path)
+    validate_experimental_set_identifiers(field)
+    physical = validate_physical_channel_layout(field)
+    count = physical['count']
     detected = []
     for tile in field.tiles:
         channels = channels_from_filename(tile.path.name, markers, count)
@@ -272,9 +406,11 @@ def resolve_field_channels(field: 'Field', spec: dict[str, Any]) -> tuple[list[s
     # This safety check is independent of whether channel labels are automatic
     # or explicitly configured; explicit labels must not hide an ID mismatch.
     validate_acquisition_identifiers(field, spec['_filename_markers'])
+    validate_experimental_set_identifiers(field)
     requested = spec['channel_names']
     if requested == 'auto':
         return detect_field_channels(field, spec['_filename_markers']), 'filename'
+    validate_physical_channel_layout(field, expected_count=len(requested))
     # Explicit override is allowed for nonstandard filenames, but compare to
     # recognisable suffixes whenever possible, to catch swapped channels.
     try:
@@ -334,6 +470,7 @@ class Field:
     group: str
     field_number: int
     tiles: tuple[Tile, ...]
+    session: str | None = None
 
 
 def fail(message: str) -> None:
@@ -346,13 +483,49 @@ def abs_path(value: str | Path) -> Path:
 
 def validate_storage_locations(root: Path, workspace: Path) -> None:
     """Keep persistent work on scratch for the protected Turbo acquisition tree."""
-    source_is_protected = root == TURBO_IMS_ROOT or TURBO_IMS_ROOT in root.parents
-    workspace_is_scratch = workspace == SCRATCH_ROOT or SCRATCH_ROOT in workspace.parents
+    canonical_root = root.expanduser().resolve(strict=False)
+    canonical_workspace = workspace.expanduser().resolve(strict=False)
+    canonical_turbo = TURBO_IMS_ROOT.expanduser().resolve(strict=False)
+    canonical_scratch = SCRATCH_ROOT.expanduser().resolve(strict=False)
+    source_is_protected = (
+        canonical_root == canonical_turbo or canonical_turbo in canonical_root.parents
+    )
+    workspace_is_scratch = (
+        canonical_workspace == canonical_scratch
+        or canonical_scratch in canonical_workspace.parents
+    )
     if source_is_protected and not workspace_is_scratch:
         fail(
             f'Inputs below {TURBO_IMS_ROOT} require a workspace below '
             f'{SCRATCH_ROOT}; got {workspace}'
         )
+
+
+def selected_session_roots(
+    input_path: Path, sessions: list[str] | tuple[str, ...] | None
+) -> list[tuple[str | None, Path]]:
+    """Validate repeatable direct-child session selectors before traversal."""
+    if not sessions:
+        return [(None, input_path)]
+    seen: set[str] = set()
+    selected: list[tuple[str | None, Path]] = []
+    for session in sessions:
+        if not isinstance(session, str) or not SESSION_NAME.fullmatch(session):
+            fail(
+                f'Invalid --session {session!r}: use one direct directory name '
+                'without path separators or traversal components'
+            )
+        folded = session.casefold()
+        if folded in seen:
+            fail(f'Duplicate --session selector: {session!r}')
+        seen.add(folded)
+        candidate = input_path / session
+        if candidate.is_symlink():
+            fail(f'Invalid --session {session!r}: symbolic-link sessions are not allowed')
+        if not candidate.is_dir():
+            fail(f'Selected session directory does not exist: {candidate}')
+        selected.append((session, candidate))
+    return selected
 
 
 def safe_slug(text: str, limit: int = 75) -> str:
@@ -444,6 +617,7 @@ def discover_tiles(field: Path, expected_count: int, contiguous: bool) -> tuple[
 def discover_fields(input_path: Path, max_depth: int, tile_count: int,
                     require_contiguous: bool, group_pattern: str | None,
                     field_numbers: set[int], *,
+                    sessions: list[str] | tuple[str, ...] | None = None,
                     issues: list[dict[str, str]] | None = None,
                     scan_only: bool = False,
                     skip_incomplete: bool = True) -> list[Field]:
@@ -454,12 +628,18 @@ def discover_fields(input_path: Path, max_depth: int, tile_count: int,
     --strict-incomplete restores fail-fast behavior for missing tiles.
     Other invalid raw tiles (duplicates, bad filenames, extra tiles) stay fatal.
     """
-    discovered = discover_field_paths(input_path, max_depth)
+    discovered: list[tuple[Path, str, int, str | None]] = []
+    for session, search_root in selected_session_roots(input_path, sessions):
+        discovered.extend(
+            (path, group, number, session)
+            for path, group, number in discover_field_paths(search_root, max_depth)
+        )
     if not discovered:
-        fail(f"No Field_1 or <base>_Field_1 directories found under {input_path}. Check --max-depth.")
+        selected = f' in sessions {list(sessions)}' if sessions else ''
+        fail(f"No Field_1 or <base>_Field_1 directories found under {input_path}{selected}. Check --max-depth.")
     out: list[Field] = []
     selected_count = 0
-    for path, group, number in discovered:
+    for path, group, number, session in discovered:
         if group_pattern and not fnmatch.fnmatchcase(group.casefold(), group_pattern.casefold()):
             continue
         if field_numbers and number not in field_numbers:
@@ -478,18 +658,19 @@ def discover_fields(input_path: Path, max_depth: int, tile_count: int,
                 if issues is not None:
                     issues.append({
                         'path': str(path), 'group': group,
+                        'session': session or '',
                         'field_number': str(number),
                         'kind': 'incomplete' if incomplete else 'invalid',
                         'reason': message,
                     })
                 continue
             raise
-        out.append(Field(path, group, number, tiles))
+        out.append(Field(path, group, number, tiles, session))
     if selected_count == 0:
         fail(f"No fields left after selection (group={group_pattern!r}, field={sorted(field_numbers)})")
     if not out and not scan_only:
         fail(f"No complete {tile_count}-tile fields selected; all selected fields are incomplete or invalid. Review the scan report.")
-    out.sort(key=lambda f: (str(f.path.parent).casefold(), f.group.casefold(), f.field_number, str(f.path)))
+    out.sort(key=lambda f: (str(f.path).casefold(), f.group.casefold(), f.field_number))
     return out
 
 
@@ -513,6 +694,202 @@ def atomic_json(path: Path, obj: Any) -> None:
     finally:
         if temp.exists():
             temp.unlink()
+
+
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def repository_git_state(repo: Path) -> dict[str, Any]:
+    """Return reproducibility state without modifying the checkout."""
+    try:
+        commit = subprocess.run(
+            ['git', '-C', str(repo), 'rev-parse', 'HEAD'],
+            text=True, capture_output=True, check=True,
+        ).stdout.strip()
+        status = subprocess.run(
+            ['git', '-C', str(repo), 'status', '--porcelain'],
+            text=True, capture_output=True, check=True,
+        ).stdout.splitlines()
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        return {'commit': None, 'dirty': None, 'status': [], 'error': str(exc)}
+    return {'commit': commit, 'dirty': bool(status), 'status': status}
+
+
+def require_production_git_state(
+    state: dict[str, Any], *, allow_dirty: bool,
+) -> None:
+    if state.get('commit') is None:
+        fail('Production run-plan preparation requires a Git checkout with a recorded commit')
+    if state.get('dirty') is not False and not allow_dirty:
+        fail(
+            'Production run-plan preparation refuses a dirty repository checkout. '
+            'Commit/stash changes or explicitly use --allow-dirty-repository.'
+        )
+
+
+def load_run_plan(plan_file: Path) -> dict[str, Any]:
+    raw = json.loads(plan_file.read_text(encoding='utf-8'))
+    if not isinstance(raw, dict) or raw.get('schema') != 1:
+        fail(f'Run plan must be a schema-1 JSON object: {plan_file}')
+    required = {'name', 'input_root', 'sessions', 'expected', 'configuration'}
+    missing = required - set(raw)
+    if missing:
+        fail(f'Run plan is missing keys {sorted(missing)}: {plan_file}')
+    if not isinstance(raw['name'], str) or not raw['name'].strip():
+        fail('Run plan name must be a nonempty string')
+    if not isinstance(raw['input_root'], str) or not Path(raw['input_root']).is_absolute():
+        fail('Run plan input_root must be an absolute path string')
+    sessions = raw['sessions']
+    if not isinstance(sessions, list) or not sessions:
+        fail('Run plan sessions must be a nonempty list')
+    names = []
+    total = 0
+    for item in sessions:
+        if (not isinstance(item, dict) or set(item) != {'name', 'complete_fields'}
+                or not isinstance(item['name'], str)
+                or not SESSION_NAME.fullmatch(item['name'])
+                or isinstance(item['complete_fields'], bool)
+                or not isinstance(item['complete_fields'], int)
+                or item['complete_fields'] < 0):
+            fail(f'Invalid run-plan session entry: {item!r}')
+        names.append(item['name'])
+        total += item['complete_fields']
+    if len({name.casefold() for name in names}) != len(names):
+        fail('Run plan contains duplicate session names')
+    expected = raw['expected']
+    expected_keys = {
+        'complete_fields', 'incomplete_fields', 'original_tiles',
+        'physical_channels_per_tile', 'biological_channels',
+    }
+    if not isinstance(expected, dict) or set(expected) != expected_keys:
+        fail(f'Run plan expected must contain exactly {sorted(expected_keys)}')
+    integers = [
+        expected['complete_fields'], expected['incomplete_fields'],
+        expected['original_tiles'], expected['physical_channels_per_tile'],
+    ]
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+           for value in integers):
+        fail('Run plan expected counts must be nonnegative integers')
+    if expected['complete_fields'] != total:
+        fail('Run plan complete_fields does not equal the sum of its sessions')
+    channels = expected['biological_channels']
+    if (not isinstance(channels, list) or not channels
+            or any(not isinstance(name, str) or not CHANNEL.fullmatch(name)
+                   for name in channels)):
+        fail('Run plan biological_channels must be a nonempty channel-name list')
+    if expected['original_tiles'] != expected['complete_fields'] * 4:
+        fail('Run plan original_tiles must equal four tiles per complete field')
+    if expected['physical_channels_per_tile'] != len(channels):
+        fail('Run plan physical channel count must equal biological channel count')
+    configuration = raw['configuration']
+    if (not isinstance(configuration, dict)
+            or set(configuration) != {'filename', 'sha256'}
+            or not isinstance(configuration['filename'], str)
+            or not re.fullmatch(r'[0-9a-f]{64}', str(configuration['sha256']))):
+        fail('Run plan configuration must contain filename and lowercase SHA-256')
+    return raw
+
+
+def apply_run_plan_selection(
+    args: argparse.Namespace, root: Path, spec_path: Path | None,
+) -> tuple[dict[str, Any] | None, Path | None]:
+    value = getattr(args, 'run_plan', None)
+    if not value:
+        return None, None
+    plan_path = abs_path(value)
+    plan = load_run_plan(plan_path)
+    expected_root = Path(plan['input_root']).expanduser().resolve(strict=False)
+    if root.resolve(strict=False) != expected_root:
+        fail(f'Run plan input root is {expected_root}, not {root}')
+    planned_sessions = [item['name'] for item in plan['sessions']]
+    selected = list(getattr(args, 'session', None) or [])
+    if selected:
+        # This also rejects duplicates, traversal, symlinks and missing sessions.
+        selected_session_roots(root, selected)
+        if {name.casefold() for name in selected} != {
+            name.casefold() for name in planned_sessions
+        } or len(selected) != len(planned_sessions):
+            fail('Explicit --session selectors do not exactly match the run plan')
+    else:
+        args.session = planned_sessions
+    if spec_path is None:
+        fail('--run-plan requires --spec so channel mapping and configuration can be validated')
+    configured = plan['configuration']
+    if spec_path.name != configured['filename']:
+        fail(
+            f'Run plan requires configuration {configured["filename"]}, '
+            f'not {spec_path.name}'
+        )
+    digest = sha256_file(spec_path)
+    if digest != configured['sha256']:
+        fail(
+            f'Configuration checksum differs from run plan: {digest} != '
+            f'{configured["sha256"]}'
+        )
+    return plan, plan_path
+
+
+def validate_run_plan_fields(
+    plan: dict[str, Any], fields: list[Field], issues: list[dict[str, str]],
+    spec: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate the complete pre-submission audit encoded by a run plan."""
+    expected = plan['expected']
+    invalid = [issue for issue in issues if issue['kind'] != 'incomplete']
+    if invalid:
+        fail(f'Run plan found {len(invalid)} invalid field(s), which cannot be skipped')
+    incomplete = sum(issue['kind'] == 'incomplete' for issue in issues)
+    if incomplete != expected['incomplete_fields']:
+        fail(
+            f'Run plan expected {expected["incomplete_fields"]} incomplete fields; '
+            f'found {incomplete}'
+        )
+    if len(fields) != expected['complete_fields']:
+        fail(
+            f'Run plan expected {expected["complete_fields"]} complete fields; '
+            f'found {len(fields)}'
+        )
+    session_counts = {item['name']: 0 for item in plan['sessions']}
+    for field in fields:
+        if field.session not in session_counts:
+            fail(f'Field came from an unplanned session: {field.path}')
+        session_counts[field.session] += 1
+    expected_counts = {
+        item['name']: item['complete_fields'] for item in plan['sessions']
+    }
+    if session_counts != expected_counts:
+        fail(
+            f'Run-plan complete-field counts differ by session: '
+            f'found={session_counts}, expected={expected_counts}'
+        )
+    tile_count = sum(len(field.tiles) for field in fields)
+    if tile_count != expected['original_tiles']:
+        fail(
+            f'Run plan expected {expected["original_tiles"]} original IMS tiles; '
+            f'found {tile_count}'
+        )
+    required_channels = expected['biological_channels']
+    physical_count = expected['physical_channels_per_tile']
+    for field in fields:
+        channels, _ = resolve_field_channels(field, spec)
+        if channels != required_channels:
+            fail(
+                f'{field.path}: biological channels {channels} do not match '
+                f'run plan {required_channels}'
+            )
+        validate_physical_channel_layout(
+            field, expected_count=physical_count, require_metadata=True,
+        )
+    return {
+        'passed': True,
+        'complete_fields': len(fields),
+        'incomplete_fields': incomplete,
+        'original_tiles': tile_count,
+        'session_complete_fields': session_counts,
+        'biological_channels': required_channels,
+        'physical_channels_per_tile': physical_count,
+    }
 
 
 def load_spec(spec_file: Path, *, require_fiji: bool = True) -> dict[str, Any]:
@@ -591,7 +968,8 @@ def render_report(fields: list[Field], spec: dict[str, Any] | None = None,
         by_group[f.group] = by_group.get(f.group,0)+1
         ids = [t.index for t in f.tiles]
         staging = ', '.join(f'F{t.index:02d}→F{j:02d}' for j,t in enumerate(f.tiles))
-        print(f'  [{i:03d}] {f.group} / Field_{f.field_number}  tile IDs={ids}  {staging}')
+        session = f'{f.session} / ' if f.session else ''
+        print(f'  [{i:03d}] {session}{f.group} / Field_{f.field_number}  tile IDs={ids}  {staging}')
         print(f'        {f.path}')
     print('Group totals:', ', '.join(f'{k}: {v}' for k,v in sorted(by_group.items())))
     if issues:
@@ -623,6 +1001,7 @@ def choose_fields(args: argparse.Namespace,
     tile_count = args.grid[0]*args.grid[1]
     return discover_fields(path, args.max_depth, tile_count, args.require_contiguous,
                            args.group, set(args.field or []),
+                           sessions=getattr(args, 'session', None),
                            issues=issues, scan_only=getattr(args, 'command', None) == 'scan',
                            skip_incomplete=not getattr(args, 'strict_incomplete', False))
 
@@ -666,10 +1045,16 @@ def create_job_config(spec: dict[str, Any], job: dict[str, Any], repo: Path) -> 
 
 
 def do_scan(args: argparse.Namespace) -> int:
+    root = abs_path(args.input)
+    spec_path = abs_path(args.spec) if args.spec else None
+    plan, _ = apply_run_plan_selection(args, root, spec_path)
     issues: list[dict[str, str]] = []
     fields = choose_fields(args, issues)
-    spec = load_spec(abs_path(args.spec), require_fiji=False) if args.spec else None
-    render_report(fields, spec, issues, tolerate_channel_errors=True)
+    spec = load_spec(spec_path, require_fiji=False) if spec_path else None
+    render_report(fields, spec, issues, tolerate_channel_errors=plan is None)
+    if plan is not None:
+        validation = validate_run_plan_fields(plan, fields, issues, spec)
+        print('\nRUN PLAN VALIDATED (read-only): ' + json.dumps(validation, sort_keys=True))
     if not spec:
         for field in fields:
             try:
@@ -727,6 +1112,7 @@ def do_prepare(args: argparse.Namespace) -> int:
     repo = abs_path(args.repository)
     spec_path = abs_path(args.spec)
     spec = load_spec(spec_path)
+    plan, plan_path = apply_run_plan_selection(args, root, spec_path)
     if not (repo/'run_ims_pipeline.py').is_file() or not (repo/'run_stitched_pipeline.py').is_file() or not (repo/'Stitching/IMSTIFF_trim_zero_padding.py').is_file():
         fail(f'Repository is missing original IMS/mosaic/stitched pipeline scripts: {repo}')
     grid = spec['stitching']['grid']
@@ -736,6 +1122,16 @@ def do_prepare(args: argparse.Namespace) -> int:
     issues: list[dict[str, str]] = []
     fields = choose_fields(args, issues)
     render_report(fields, spec, issues)
+    plan_validation = (
+        validate_run_plan_fields(plan, fields, issues, spec)
+        if plan is not None else None
+    )
+    git_state = repository_git_state(repo)
+    if plan is not None:
+        require_production_git_state(
+            git_state,
+            allow_dirty=getattr(args, 'allow_dirty_repository', False),
+        )
     if workspace.exists() and any(workspace.iterdir()):
         fail(f'Workspace exists and is nonempty: {workspace}. Use a fresh workspace (or inspect the existing manifest).')
     if workspace == root or root in workspace.parents:
@@ -752,6 +1148,11 @@ def do_prepare(args: argparse.Namespace) -> int:
         names.add(name)
         stage_sample_name = name
         channel_names, naming_basis = resolve_field_channels(field,spec)
+        physical = validate_physical_channel_layout(
+            field, expected_count=len(channel_names),
+            require_metadata=plan is not None,
+        )
+        set_number = validate_experimental_set_identifiers(field)
         nuclear_channel = resolve_nuclear_channel(channel_names,spec['nuclear_channel'])
         if len(channel_names)<2:
             fail(f'{field.path}: full downstream analysis needs a nuclear channel and at least one marker')
@@ -768,6 +1169,7 @@ def do_prepare(args: argparse.Namespace) -> int:
                             'staged': str(target)})
         job = {
             'index': index, 'name': name, 'group': field.group,
+            'session': field.session,
             'field_number': field.field_number, 'source_field': str(field.path),
             'staging_dir': str(staging), 'stage_sample_name': stage_sample_name,
             'output_dir': str(workspace/'outputs'/name),
@@ -775,6 +1177,10 @@ def do_prepare(args: argparse.Namespace) -> int:
             'channel_names': channel_names,
             'nuclear_channel': nuclear_channel,
             'channel_naming_basis': naming_basis,
+            'experimental_set_number': set_number,
+            'physical_channel_count': physical['count'],
+            'physical_channel_indices': physical['indices'],
+            'physical_channel_names': physical['names'],
             'tile_map': tilemap,
         }
         atomic_json(Path(job['config_path']), create_job_config(spec, job, repo))
@@ -784,12 +1190,22 @@ def do_prepare(args: argparse.Namespace) -> int:
         'batch_runner': str(SCRIPT_PATH), 'slurm_runner': str(SBATCH_PATH),
         'workspace': str(workspace), 'spec_path': str(spec_path),
         'spec_sha256': hashlib.sha256(spec_path.read_bytes()).hexdigest(),
+        'repository_git': git_state,
+        'batch_runner_sha256': sha256_file(SCRIPT_PATH),
+        'slurm_runner_sha256': sha256_file(SBATCH_PATH),
+        'selected_sessions': list(getattr(args, 'session', None) or []),
         'backend': spec['backend'], 'channel_names_setting': spec['channel_names'],
         'jobs': jobs,
         'skipped_fields': issues,
         'eligible_field_count': len(jobs),
         'skipped_field_count': len(issues),
         'incomplete_field_policy': 'skip_and_record',
+        'run_plan': ({
+            'name': plan['name'],
+            'path': str(plan_path),
+            'sha256': sha256_file(plan_path),
+            'validation': plan_validation,
+        } if plan is not None else None),
     }
     atomic_json(workspace/'manifest.json',manifest)
     # Human-readable audit of every omitted incomplete field, even if the list is empty.
@@ -797,7 +1213,7 @@ def do_prepare(args: argparse.Namespace) -> int:
     skip_csv_temp = workspace / 'skipped_fields.csv.tmp'
     try:
         with skip_csv_temp.open('w', newline='', encoding='utf-8') as handle:
-            writer = csv.DictWriter(handle, fieldnames=['path', 'group', 'field_number', 'kind', 'reason'])
+            writer = csv.DictWriter(handle, fieldnames=['path', 'session', 'group', 'field_number', 'kind', 'reason'])
             writer.writeheader()
             writer.writerows(issues)
         skip_csv_temp.replace(skip_csv)
@@ -808,6 +1224,13 @@ def do_prepare(args: argparse.Namespace) -> int:
     print(f'\nPrepared {len(jobs)} complete-field jobs in {workspace}; automatically skipped {len(issues)} incomplete field(s).')
     print(f'Skipped-field report: {workspace / "skipped_fields.csv"}')
     print(f'Manifest: {workspace / "manifest.json"}')
+    if plan_validation is not None:
+        print('Production run plan: VALIDATED')
+        production_submitter = SCRIPT_DIR / 'submit_production_batches.py'
+        print(f'Validate manifest: python {SCRIPT_PATH} validate --manifest {workspace / "manifest.json"}')
+        print(f'Preview production arrays: python {production_submitter} --manifest {workspace / "manifest.json"} --print-only')
+        print(f'Submit production arrays: python {production_submitter} --manifest {workspace / "manifest.json"}')
+        return 0
     print(f'Run one metadata preflight: python {SCRIPT_PATH} preflight --manifest {workspace / "manifest.json"} --index 0')
     print(f'Slurm first job: cd {workspace} && sbatch --array=0 {SBATCH_PATH} {workspace / "manifest.json"} {SCRIPT_PATH}')
     print(f'Slurm full batch: cd {workspace} && sbatch --array=0-{len(jobs)-1}%2 {SBATCH_PATH} {workspace / "manifest.json"} {SCRIPT_PATH}')
@@ -829,6 +1252,77 @@ def validate_job(job: dict[str,Any], manifest: dict[str,Any]) -> None:
             fail(f'Staged tile symlink mismatch/missing: {staged} -> {source}')
         if file_stats(source) != tile['source_stats']:
             fail(f'Source IMS file changed since prepare: {source}. Prepare a fresh workspace.')
+
+
+def validate_manifest_for_submission(
+    manifest: dict[str, Any], *, check_sources: bool = True,
+) -> dict[str, Any]:
+    """Validate indices, scratch-contained outputs, provenance and source links."""
+    jobs = manifest['jobs']
+    if not jobs:
+        fail('Manifest has zero fields')
+    if [job.get('index') for job in jobs] != list(range(len(jobs))):
+        fail('Manifest must have sequential field indices 0..N-1')
+    if manifest.get('eligible_field_count') != len(jobs):
+        fail('Manifest eligible_field_count does not match jobs')
+    workspace = Path(manifest['workspace']).resolve(strict=False)
+    validate_storage_locations(Path(manifest['input_root']), workspace)
+
+    def require_in_workspace(value: str, label: str) -> None:
+        path = Path(value).resolve(strict=False)
+        if path != workspace and workspace not in path.parents:
+            fail(f'{label} is outside the scratch workspace: {path}')
+
+    require_in_workspace(manifest['compat_repository'], 'Compatibility repository')
+    for job in jobs:
+        require_in_workspace(job['staging_dir'], 'Staging directory')
+        require_in_workspace(job['output_dir'], 'Output directory')
+        require_in_workspace(job['config_path'], 'Generated configuration')
+        if check_sources:
+            validate_job(job, manifest)
+
+    plan = manifest.get('run_plan')
+    if plan is not None:
+        validation = plan.get('validation', {})
+        if not validation.get('passed'):
+            fail('Production manifest does not contain a passed run-plan validation')
+        expected_fields = validation.get('complete_fields')
+        expected_tiles = validation.get('original_tiles')
+        actual_tiles = sum(len(job['tile_map']) for job in jobs)
+        if expected_fields != len(jobs) or expected_tiles != actual_tiles:
+            fail('Production manifest counts no longer match its run-plan validation')
+        plan_path = Path(plan['path'])
+        if not plan_path.is_file() or sha256_file(plan_path) != plan['sha256']:
+            fail('Committed production run plan changed or is missing after preparation')
+        spec_path = Path(manifest['spec_path'])
+        if not spec_path.is_file() or sha256_file(spec_path) != manifest['spec_sha256']:
+            fail('Scientific configuration changed or is missing after preparation')
+        if sha256_file(Path(manifest['batch_runner'])) != manifest['batch_runner_sha256']:
+            fail('Batch runner changed after preparation')
+        if sha256_file(Path(manifest['slurm_runner'])) != manifest['slurm_runner_sha256']:
+            fail('Slurm runner changed after preparation')
+        current_git = repository_git_state(Path(manifest['repository']))
+        recorded_git = manifest.get('repository_git', {})
+        if current_git.get('commit') is None or recorded_git.get('commit') is None:
+            fail('Production submission requires recorded Git commit provenance')
+        if current_git['commit'] != recorded_git.get('commit'):
+            fail('Repository commit changed after production manifest preparation')
+        if current_git.get('dirty') is not False:
+            fail('Repository is dirty; production submission requires the recorded clean checkout')
+    return {
+        'fields': len(jobs),
+        'tiles': sum(len(job['tile_map']) for job in jobs),
+        'production_run_plan': plan.get('name') if plan else None,
+        'sources_checked': check_sources,
+    }
+
+
+def do_validate(args: argparse.Namespace) -> int:
+    manifest_path = abs_path(args.manifest)
+    manifest = load_manifest(manifest_path)
+    summary = validate_manifest_for_submission(manifest, check_sources=True)
+    print('MANIFEST VALID: ' + json.dumps(summary, sort_keys=True))
+    return 0
 
 
 def run_command(command: list[str], label: str) -> None:
@@ -1017,11 +1511,13 @@ def do_inspect(args:argparse.Namespace) -> int:
 
 def add_selection(p:argparse.ArgumentParser) -> None:
     p.add_argument('--input',required=True,help='Olti_* directory, group directory or one Field_* directory')
+    p.add_argument('--session',action='append',help='Direct child session name to include; repeat for multiple sessions')
     p.add_argument('--group',help='Optional group name glob, e.g. Exp17_* or *LHX6_PV*')
     p.add_argument('--field',type=int,action='append',help='Include only Field_N; repeat for multiple')
     p.add_argument('--max-depth',type=int,default=5,help='Maximum nested directory levels to examine (default 5)')
     p.add_argument('--grid',type=int,nargs=2,default=[2,2],metavar=('X','Y'))
     p.add_argument('--require-contiguous',action='store_true',help='Require original tile IDs to be contiguous; default stages any 4 ascending indexes')
+    p.add_argument('--run-plan',help='Optional JSON run plan that fixes sessions and validates expected counts/configuration')
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1038,6 +1534,7 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument('--spec',required=True,help='Analysis profile JSON (generic or reporter)')
     prep.add_argument('--workspace',required=True,help='New empty work/output root, separate from source IMS tree')
     prep.add_argument('--repository',default=str(REPOSITORY_ROOT),help='ImageAnalysisScripts-Copy checkout directory')
+    prep.add_argument('--allow-dirty-repository',action='store_true',help='Allow run-plan preparation from a dirty checkout (recorded in provenance; not recommended)')
     for kind in ('preflight','run'):
         action=sub.add_parser(kind,help=f'{kind} one manifest job by index')
         action.add_argument('--manifest',required=True)
@@ -1046,6 +1543,8 @@ def build_parser() -> argparse.ArgumentParser:
             action.add_argument('--resume',action='store_true')
     show=sub.add_parser('inspect',help='Inspect generated manifest & completion status')
     show.add_argument('--manifest',required=True)
+    validate=sub.add_parser('validate',help='Validate manifest, provenance, staged links and source stats')
+    validate.add_argument('--manifest',required=True)
     return p
 
 
@@ -1056,6 +1555,7 @@ def main(argv:list[str]|None=None)->int:
         if args.command=='scan':return do_scan(args)
         if args.command=='prepare':return do_prepare(args)
         if args.command=='inspect':return do_inspect(args)
+        if args.command=='validate':return do_validate(args)
         if args.command=='preflight':
             args.resume=False
             return do_job(args,True)

@@ -31,6 +31,7 @@ def submit(manifest_path: Path, max_parallel: int, *, print_only: bool = False,
            allow_duplicate: bool = False, sbatch: str = 'sbatch') -> str | None:
     manifest_path = batch.abs_path(manifest_path)
     manifest = batch.load_manifest(manifest_path)
+    batch.validate_manifest_for_submission(manifest, check_sources=True)
     workspace = Path(manifest['workspace'])
     if manifest_path != workspace / 'manifest.json':
         batch.fail('Manifest must be located at <workspace>/manifest.json')
@@ -107,6 +108,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument('--repository', default=str(REPOSITORY_ROOT),
                         help='Repository root containing the existing controllers')
     parser.add_argument('--group', help='Optional group glob, e.g. Exp17_157-2_Set2*')
+    parser.add_argument('--session', action='append', help='Direct child session name to include; repeatable')
     parser.add_argument('--field', type=int, action='append', help='Select only Field_N (repeatable)')
     parser.add_argument('--max-depth', type=int, default=5, help='Max number of directory levels searched')
     parser.add_argument('--grid', type=int, nargs=2, default=[2,2], metavar=('X','Y'),
@@ -119,7 +121,10 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument('--require-contiguous', action='store_true',
                         help='Require four consecutive original tile numbers; not necessarily F00-F03')
     parser.add_argument('--max-parallel', type=int, default=2,
-                        help='Maximum concurrently running field jobs (Slurm % throttle)')
+                        help='Maximum concurrently running field jobs (Slurm %% throttle)')
+    parser.add_argument('--run-plan', help='JSON run plan used to select sessions and validate expected counts')
+    parser.add_argument('--allow-dirty-repository', action='store_true',
+                        help='Allow run-plan preparation from a dirty checkout (not recommended)')
     parser.add_argument('--print-only', action='store_true',
                         help='Prepare the workspace but print submission command without submitting')
     parser.add_argument('--allow-duplicate', action='store_true',
@@ -138,17 +143,21 @@ def main(argv: list[str] | None = None) -> int:
                 parser.error('--allow-duplicate is only supported with --manifest')
             # Use precisely the existing discovery and preparation implementation.
             prepare_args = argparse.Namespace(
-                input=args.input, group=args.group, field=args.field,
+                input=args.input, session=args.session, group=args.group, field=args.field,
                 max_depth=args.max_depth, grid=args.grid,
                 require_contiguous=args.require_contiguous,
                 strict_incomplete=args.strict_incomplete, skip_incomplete=args.skip_incomplete, spec=args.spec,
                 workspace=args.workspace, repository=args.repository,
+                run_plan=args.run_plan,
+                allow_dirty_repository=args.allow_dirty_repository,
             )
             batch.do_prepare(prepare_args)
             manifest_path = batch.abs_path(args.workspace) / 'manifest.json'
         else:
-            if args.spec or args.workspace or args.group or args.field or args.skip_incomplete or args.strict_incomplete:
-                parser.error('--spec/--workspace/--group/--field only apply to --input')
+            if (args.spec or args.workspace or args.session or args.group or args.field
+                    or args.skip_incomplete or args.strict_incomplete or args.run_plan
+                    or args.allow_dirty_repository):
+                parser.error('--spec/--workspace/--session/--group/--field/--run-plan only apply to --input')
             manifest_path = batch.abs_path(args.manifest)
         submit(manifest_path, args.max_parallel,
                print_only=args.print_only, allow_duplicate=args.allow_duplicate)
