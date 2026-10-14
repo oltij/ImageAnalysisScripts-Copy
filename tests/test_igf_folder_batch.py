@@ -107,6 +107,19 @@ class IGFFolderBatchTests(unittest.TestCase):
                     fields[0], batch.DEFAULT_FILENAME_MARKERS
                 )
 
+    def test_explicit_channel_names_cannot_hide_acquisition_mismatch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            self._field(temp, directory_id=7, filename_id=8)
+            field = batch.discover_fields(
+                temp, max_depth=5, tile_count=4, require_contiguous=False,
+                group_pattern=None, field_numbers=set(),
+            )[0]
+            spec = batch.load_spec(CONFIG_PATH, require_fiji=False)
+            spec["channel_names"] = ["DAPI", "GFP", "LHX6", "PV"]
+            with self.assertRaisesRegex(ValueError, "Acquisition identifier mismatch"):
+                batch.resolve_field_channels(field, spec)
+
     def test_numeric_marker_suffix_is_not_treated_as_acquisition_identifier(self):
         markers = batch.DEFAULT_FILENAME_MARKERS
         self.assertIsNone(

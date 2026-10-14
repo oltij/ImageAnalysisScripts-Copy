@@ -269,6 +269,9 @@ def detect_field_channels(field: 'Field', markers: list[str] | tuple[str, ...]) 
 
 
 def resolve_field_channels(field: 'Field', spec: dict[str, Any]) -> tuple[list[str], str]:
+    # This safety check is independent of whether channel labels are automatic
+    # or explicitly configured; explicit labels must not hide an ID mismatch.
+    validate_acquisition_identifiers(field, spec['_filename_markers'])
     requested = spec['channel_names']
     if requested == 'auto':
         return detect_field_channels(field, spec['_filename_markers']), 'filename'
