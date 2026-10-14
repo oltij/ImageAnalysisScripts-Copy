@@ -219,9 +219,23 @@ def spatial_subsample(points: np.ndarray, max_points: int, seed: int) -> np.ndar
 
 
 def phase_correlation_shift(fixed: np.ndarray, moving: np.ndarray, upsample_factor: int = 10) -> Tuple[np.ndarray, float, float]:
-    """Return shift to apply to moving so it aligns to fixed."""
+    """Return moving-to-fixed coarse shift; tolerate different 2-D image shapes.
+
+    Images are padded on bottom/right *temporarily* only to make their shapes
+    compatible with phase_cross_correlation. Their (0,0) pixel origins stay
+    unchanged; no registered output or source TIFF is padded or resampled here.
+    The original identical-shape code path is retained exactly.
+    """
     f = fixed.astype(np.float32, copy=False)
     m = moving.astype(np.float32, copy=False)
+    if f.shape != m.shape:
+        common_y = max(f.shape[0], m.shape[0])
+        common_x = max(f.shape[1], m.shape[1])
+        temporary_fixed = np.zeros((common_y, common_x), dtype=np.float32)
+        temporary_moving = np.zeros((common_y, common_x), dtype=np.float32)
+        temporary_fixed[:f.shape[0], :f.shape[1]] = f
+        temporary_moving[:m.shape[0], :m.shape[1]] = m
+        f, m = temporary_fixed, temporary_moving
 
     shift, error, phasediff = phase_cross_correlation(
         f, m, upsample_factor=upsample_factor
@@ -527,9 +541,10 @@ def main() -> int:
     log(f"  Moving shape: {moving.shape}")
 
     if fixed.shape != moving.shape:
-        raise ValueError(
-            "The two max projections have different shapes. For this preliminary "
-            f"registration, matching coordinate boxes are required. Fixed={fixed.shape}, Moving={moving.shape}."
+        log(
+            "  Different native XY shapes are permitted; coarse phase correlation "
+            "uses temporary zero-padded arrays, and the final CASTalign output "
+            "keeps the fixed image canvas."
         )
 
     # ---------------------------------------------------------------

@@ -340,9 +340,15 @@ def validate_inputs(cfg: dict) -> dict[str, dict[str, object]]:
         detail = ", ".join(
             f"{name}={tuple(info['yx_shape'])}" for name, info in descriptions.items()
         )
-        raise ValueError(
-            "All channels must share one XY pixel canvas before registration/colocalization; "
-            + detail
+        if not cfg.get("alignment", {}).get("enabled", True):
+            raise ValueError(
+                "Channels must share one XY pixel canvas when CASTalign is disabled; "
+                + detail
+            )
+        print(
+            "INFO: Native stitched images have different XY shapes; "
+            "CASTalign will register each marker to the nuclear reference: " + detail,
+            flush=True,
         )
     validate_cellprofiler_pipeline(cfg["_pipeline"])
     return descriptions

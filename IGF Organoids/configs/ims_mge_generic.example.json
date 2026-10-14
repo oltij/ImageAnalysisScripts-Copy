@@ -1,0 +1,72 @@
+{
+  "backend": "generic",
+  "channel_names": "auto",
+  "nuclear_channel": "auto",
+  "fiji_sif": "/nfs/turbo/umms-parent/olti_ims2tiffscript/fiji_latest_bigstitcher.sif",
+  "ims_unit": "um",
+  "trim_zero_padding": true,
+  "analysis_downsampling": {
+    "factor": 1,
+    "method": "area_mean"
+  },
+  "stitching": {
+    "grid": [
+      2,
+      2
+    ],
+    "overlap": 10.0,
+    "min_correlation": 0.55,
+    "basic_sample_planes": 12,
+    "intensity_downsampling": 32,
+    "intensity_max_inliers": 10000,
+    "intensity_offset_only": 0.5,
+    "intensity_unmodified": 0.5
+  },
+  "analysis": {
+    "cellprofiler": {
+      "pipeline": "CellProfiler/MGEOPVFinal.cppipe",
+      "conda_env": "cellprofiler-native",
+      "conda_executable": "conda"
+    },
+    "alignment": {
+      "enabled": true,
+      "extra_args": [
+        "--skip-phase-init",
+        "--match-gate-um",
+        "25",
+        "--iterations",
+        "5",
+        "--max-points",
+        "1500"
+      ]
+    },
+    "pairs": "auto",
+    "thresholds": {
+      "marker_nuclear": 0.25,
+      "marker_marker": 0.25
+    },
+    "filters": {
+      "intensity": {
+        "Mean intensity": {
+          "percentile": 0,
+          "keep": "above"
+        }
+      },
+      "shape": {
+        "Area_um2": {
+          "percentile": 0,
+          "keep": "above"
+        }
+      }
+    },
+    "reports": {
+      "organoid_mask": true,
+      "intensity": true,
+      "shape": true,
+      "colocalization": true
+    }
+  },
+  "filename_markers": [
+    "ASCL1"
+  ]
+}
