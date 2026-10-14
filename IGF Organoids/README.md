@@ -1,270 +1,334 @@
 # IGF organoid IMS folder batch
 
-This directory packages the working Great Lakes folder-batch controller around
-the repository's existing scientific pipeline. It starts with the original
-four-tile `.ims` acquisitions and runs the established sequence:
+This directory contains the production Great Lakes orchestration around the
+repository's existing microscopy pipeline. It starts from each field's four
+original `.ims` tiles and runs the established workflow:
 
 1. IMS export
 2. BaSiC correction
-3. BigStitcher mosaic assembly and maximum projections
+3. BigStitcher 2×2 mosaic assembly and maximum projections
 4. initial CellProfiler segmentation for registration anchors
 5. CASTalign registration
 6. segmentation again in the aligned coordinate system
-7. shared nuclear-tissue-mask QC, ROI filtering, and colocalization
+7. shared DAPI-tissue-mask QC, ROI filtering, matching, and colocalization
 
-The wrapper does not replace or optimize those algorithms. It calls the
-existing repository controllers and preserves their settings.
+The wrappers do not replace, optimize, or change those scientific algorithms.
 
-## Files
+## Committed files
 
-- `run_folder_batch.py`: recursive discovery, validation, symlink staging,
-  manifests, per-field execution, inspection, and resume support.
-- `submit_folder_batch.py`: one-command preparation and Slurm array submission.
-- `run_folder_batch.sbatch`: the working Great Lakes CPU job profile.
-- `configs/ims_mge_generic.example.json`: portable batch profile derived from
-  the supplied working configuration.
+- `run_folder_batch.py`: session-scoped discovery, metadata validation, scratch
+  staging, per-field manifests, execution, inspection, and resume support.
+- `submit_folder_batch.py`: generic preparation and single-array submission.
+- `submit_production_batches.py`: the production 94-field submission as two
+  dependent arrays of 47.
+- `run_folder_batch.sbatch`: the validated Great Lakes per-field job profile.
+- `configs/ims_mge_generic.example.json`: the unchanged production scientific
+  configuration.
+- `configs/production_94_fields.json`: the audited sessions, expected counts,
+  channel mapping, and configuration checksum for the 94-field run.
 
-All commands may be launched from any current directory. The scripts determine
-the repository root from their own absolute paths. `submit_folder_batch.py`
-passes the absolute `run_folder_batch.py` path into the Slurm job because `$0`
-inside a job refers to Slurm's spooled copy, not reliably to the checkout.
+The scripts resolve the repository root from their own absolute locations.
+Absolute manifest and runner paths are passed to Slurm because a job executes a
+spooled copy of the `.sbatch` file.
 
-## Source and scratch safety
+## Exact production procedure
 
-For production, keep the two roots separate:
+No command in the inspection, preparation, validation, preflight, or preview
+steps submits a Slurm job. Only step 7 calls `sbatch`.
+
+### 1. Pull a clean GitHub checkout
+
+For a new checkout:
 
 ```bash
-IMS_INPUT=/nfs/turbo/umms-parent/andor_microscope_data_dump/path/to/session
-IGF_WORKSPACE=/scratch/parent_root/parent0/$USER/igf_organoids/run_001
+cd /home/$USER
+git clone https://github.com/oltij/ImageAnalysisScripts-Copy.git
+cd ImageAnalysisScripts-Copy
+git switch main
+git pull --ff-only origin main
+git status --short
 ```
 
-The source tree is scanned, stat-checked, and read, but never written. The
-wrapper creates only symbolic links to original IMS files. The links,
-`controller_compat`, generated configs, manifests, preprocessing, logs, and all
-analysis results are created below `IGF_WORKSPACE`. Preparation rejects a
-workspace inside the source tree and rejects reuse of a nonempty workspace.
+`git status --short` must print nothing. Preparation with the production run
+plan records `git rev-parse HEAD` and refuses a dirty checkout. The escape hatch
+`--allow-dirty-repository` exists for development only and should not be used
+for this production run.
 
-For inputs below the protected Turbo root, preparation rejects any workspace
-that is not below `/scratch`. Each scientific run should use a new scratch
-workspace. Original `.ims` files under
-`/nfs/turbo/umms-parent/andor_microscope_data_dump/` remain untouched.
-
-## Great Lakes prerequisites
-
-Use the existing environments:
+Activate the existing orchestration environment:
 
 ```bash
-conda env create -f CondaEnvironment/ims-mosaic.yml
-conda env create -f CondaEnvironment/cellprofiler-native.yml
 conda activate ims-mosaic
 ```
 
-The Slurm runner preserves the working settings:
-
-- `singularity/4.4.1`
-- `SINGULARITY_BINDPATH=/gpfs:/gpfs,/scratch:/scratch`
-- `ims-mosaic` for orchestration, IMS export, and stitching
-- `cellprofiler-native` through the downstream CellProfiler configuration
-- four CPUs, 64 GB memory, standard CPU partition, and a one-day time limit
-
-No GPU is requested.
-
-## Acquisition layout and naming
-
-The input may be a complete session, a group directory, or one `Field_N`
-directory. Discovery is recursive (five levels by default) and supports an
-optional date-folder layer. Each complete field must contain four IMS tiles,
-either directly or in tile directories. Derived `FusionStitcher` IMS files are
-ignored.
-
-Both naming styles are supported:
-
-```text
-Sample_DAPI_GFP_LHX6_PV_Field_1/
-  Sample_DAPI_GFP_LHX6_PV_F00.ims
-
-Sample_DAPI_GFP_LHX6_PV_7_Field_1/
-  Sample_DAPI_GFP_LHX6_PV_7_F00.ims
-```
-
-The standalone integer after the final marker is an optional acquisition
-identifier. If present, the directory and every tile filename must use the same
-identifier. Numbers intrinsic to marker names, including `BiVe3`, `BiVe4`,
-`ASCL1`, and `NKX2_1`, are retained as marker names and are not mistaken for
-acquisition identifiers.
-
-Source tile IDs need not begin at zero. Four discovered tiles are sorted by
-their original numeric IDs and staged as `F00` through `F03`. The manifest
-records both identities. Incomplete fields are skipped and recorded by default;
-other malformed or ambiguous inputs stop preparation.
-
-## Configure
-
-Copy the example and edit it only when the acquisition requires different
-channel or scientific settings:
+Set shell variables from the repository root:
 
 ```bash
-cp "IGF Organoids/configs/ims_mge_generic.example.json" \
-  /scratch/parent_root/parent0/$USER/igf_organoids/ims_mge_generic.json
+REPO_ROOT="$PWD"
+IMS_INPUT_ROOT=/nfs/turbo/umms-parent/andor_microscope_data_dump
+IGF_CONFIG="$REPO_ROOT/IGF Organoids/configs/ims_mge_generic.example.json"
+IGF_RUN_PLAN="$REPO_ROOT/IGF Organoids/configs/production_94_fields.json"
+IGF_WORKSPACE=/scratch/parent_root/parent0/$USER/igf_organoids/production_94_001
 ```
 
-The supplied Great Lakes Fiji image remains configured at:
+Use a new workspace name if that path already exists.
+
+### 2. Inspect exactly the 12 production sessions, read-only
+
+```bash
+python "$REPO_ROOT/IGF Organoids/run_folder_batch.py" scan \
+  --input "$IMS_INPUT_ROOT" \
+  --spec "$IGF_CONFIG" \
+  --run-plan "$IGF_RUN_PLAN"
+```
+
+The committed plan expands to these sessions only:
+
+| Session | Complete fields |
+|---|---:|
+| `Olti_06_23_2026` | 12 |
+| `Olti_06_25_2026` | 8 |
+| `Olti_06_29_2026` | 7 |
+| `Olti_06_30_2026` | 6 |
+| `Olti_06_30_2026-secondslide` | 6 |
+| `Olti_07_01_2026` | 6 |
+| `Olti_07_02_2026` | 15 |
+| `Olti_07_03_2026` | 6 |
+| `Olti_07_06_2026` | 6 |
+| `Olti_07_08_2026` | 7 |
+| `Olti_07_17_2026` | 7 |
+| `Olti_07_24_2026` | 8 |
+| **Total** | **94** |
+
+`Olti_07_16_2026` and every unlisted session are excluded. The scan must end
+with `RUN PLAN VALIDATED (read-only)` and confirm:
+
+- 94 complete fields;
+- 19 incomplete fields skipped and reported;
+- 376 original IMS tiles;
+- four physical channels per tile, indices 0–3;
+- biological channels `DAPI`, `GFP`, `LHX6`, `PV` in that order;
+- no phase channel and no cross-tile metadata inconsistency.
+
+`--session NAME` is also repeatable for generic scans and preparations. Session
+selectors must be unique direct child directory names; missing names, symlinks,
+duplicates, absolute paths, and traversal components are rejected.
+
+### 3. Confirm a fresh scratch workspace
+
+```bash
+if [[ -e "$IGF_WORKSPACE" ]]; then
+  echo "Choose a new IGF_WORKSPACE; this path already exists" >&2
+  return 1 2>/dev/null || exit 1
+fi
+mkdir -p "$(dirname "$IGF_WORKSPACE")"
+df -h "$(dirname "$IGF_WORKSPACE")"
+```
+
+On Great Lakes, `/scratch/parent_root/parent0/...` may canonically resolve to
+`/gpfs/accounts/parent_root/parent0/...`. Validation resolves both the workspace
+and `/scratch` before comparison, so this valid layout is accepted. Inputs
+under the protected Turbo root are still rejected if the canonical workspace
+is outside scratch.
+
+### 4. Prepare and validate all 94 fields
+
+```bash
+python "$REPO_ROOT/IGF Organoids/run_folder_batch.py" prepare \
+  --input "$IMS_INPUT_ROOT" \
+  --spec "$IGF_CONFIG" \
+  --run-plan "$IGF_RUN_PLAN" \
+  --workspace "$IGF_WORKSPACE"
+
+python "$REPO_ROOT/IGF Organoids/run_folder_batch.py" validate \
+  --manifest "$IGF_WORKSPACE/manifest.json"
+```
+
+Preparation stops before submission unless every audited count and channel
+mapping matches. The manifest records:
+
+- the Git commit and clean/dirty status;
+- the scientific configuration path and SHA-256;
+- the run-plan path, SHA-256, and complete validation report;
+- the batch and Slurm runner hashes;
+- selected sessions, source paths and source file statistics;
+- physical channel indices/names, biological names, and any `SetN` identifier;
+- deterministic job indices 0–93 and original-to-staged tile mappings.
+
+The original Turbo tree is only read and stat-checked. The wrapper writes all
+symlinks, compatibility controllers, generated configurations, manifests,
+logs, preprocessing, and analysis outputs below `IGF_WORKSPACE`.
+
+The generated scratch `controller_compat` files are derived from the committed
+checkout. They change only path canonicalization from `Path.resolve()` to
+`Path.absolute()` in the two IMS entry points so a staged `F00` link is not
+renamed back to its original tile number. The downstream runner and TIFF-safety
+module remain symlinks to the committed repository. No scientific algorithm is
+changed.
+
+### 5. Run representative metadata preflights
+
+Run both array boundaries and one representative field in each batch:
+
+```bash
+for IGF_INDEX in 0 46 47 93; do
+  python "$REPO_ROOT/IGF Organoids/run_folder_batch.py" preflight \
+    --manifest "$IGF_WORKSPACE/manifest.json" \
+    --index "$IGF_INDEX"
+done
+```
+
+Preflight validates the original source links, source file statistics, physical
+IMS metadata, calibration, channel ordering, and intended commands without
+performing stitching or analysis.
+
+### 6. Preview the two Slurm arrays
+
+```bash
+python "$REPO_ROOT/IGF Organoids/submit_production_batches.py" \
+  --manifest "$IGF_WORKSPACE/manifest.json" \
+  --print-only
+```
+
+The preview must show:
 
 ```text
-/nfs/turbo/umms-parent/olti_ims2tiffscript/fiji_latest_bigstitcher.sif
+Batch 1: --array=0-46%47
+Batch 2: --array=47-93%47 --dependency=afterok:<BATCH1_JOB_ID>
 ```
 
-Channel names default to automatic parsing from the filename in stored
-wavelength order. The nuclear channel is identified from DAPI or Hoechst.
-Uncommon markers can be appended to `filename_markers`, or `channel_names` can
-be set explicitly in wavelength order.
+Preview mode does not call `sbatch` and does not write a submission record.
 
-The IGF alignment profile is fixed to the successful settings:
+### 7. Submit both arrays
+
+```bash
+python "$REPO_ROOT/IGF Organoids/submit_production_batches.py" \
+  --manifest "$IGF_WORKSPACE/manifest.json"
+```
+
+Batch 1 permits at most 47 simultaneous field tasks. Batch 2 also permits 47,
+but Slurm holds it under `afterok` until every Batch 1 array task succeeds. The
+helper atomically records both IDs and exact commands in:
+
+```text
+$IGF_WORKSPACE/slurm_two_batch_submission.json
+```
+
+An existing record blocks accidental duplicate submission. If Batch 1 was
+accepted but the Batch 2 `sbatch` call failed, repair the submission issue and
+run exactly:
+
+```bash
+python "$REPO_ROOT/IGF Organoids/submit_production_batches.py" \
+  --manifest "$IGF_WORKSPACE/manifest.json" \
+  --resume-second-batch
+```
+
+This reuses the recorded Batch 1 job ID instead of duplicating Batch 1.
+
+### 8. Monitor and diagnose
+
+Read the IDs:
+
+```bash
+python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["batch1_job_id"], d["batch2_job_id"])' \
+  "$IGF_WORKSPACE/slurm_two_batch_submission.json"
+```
+
+Then substitute them below:
+
+```bash
+squeue -j BATCH1_JOB_ID,BATCH2_JOB_ID
+sacct -j BATCH1_JOB_ID,BATCH2_JOB_ID \
+  --format=JobID,JobName,State,ExitCode,Elapsed,MaxRSS,NodeList,Reason
+
+tail -F "$IGF_WORKSPACE/logs/ims_BATCH1_JOB_ID_0.out"
+tail -F "$IGF_WORKSPACE/logs/ims_BATCH1_JOB_ID_0.err"
+
+python "$REPO_ROOT/IGF Organoids/run_folder_batch.py" inspect \
+  --manifest "$IGF_WORKSPACE/manifest.json"
+```
+
+Each log filename is `ims_<array-job-id>_<array-index>.out` or `.err`. Use the
+failed array index reported by `sacct` to inspect the corresponding log. Batch 2
+will not run if any Batch 1 task fails. Per-field execution always uses
+`--resume`; unchanged completed stages can therefore be reused after a failure.
+Do not use a duplicate-submission override until the recorded jobs have ended
+and their state is understood.
+
+## Source and scratch safety
+
+The protected source root is:
+
+```text
+/nfs/turbo/umms-parent/andor_microscope_data_dump
+```
+
+Original `.ims` files are never renamed, copied over, modified, or deleted.
+Staged inputs are scratch symbolic links. Preparation rejects a workspace
+inside the source tree, rejects a nonempty workspace, and—for protected Turbo
+inputs—rejects any workspace outside canonical scratch.
+
+The per-field Slurm profile remains:
+
+- account `parent0`;
+- partition `standard`;
+- one node and one task;
+- four CPUs;
+- 64 GB memory;
+- one-day time limit;
+- no GPU;
+- `singularity/4.4.1`;
+- `/gpfs:/gpfs,/scratch:/scratch` container binds;
+- `ims-mosaic` for orchestration/export/stitching;
+- `cellprofiler-native` through the downstream configuration.
+
+## Naming and biological-channel safety
+
+Discovery supports an optional date directory and field layouts such as:
+
+```text
+Sample_Set2_DAPI_GFP_LHX6_PV_Field_1/
+  Sample_Set2_DAPI_GFP_LHX6_PV_F00.ims
+
+Sample_Set2_DAPI_GFP_LHX6_PV_7_Field_1/
+  Sample_Set2_DAPI_GFP_LHX6_PV_7_F00.ims
+```
+
+`Set1`, `Set2`, `Set3`, and similar tokens are experiment metadata, never
+biological channels. The set number is stored separately in each manifest job.
+An optional standalone acquisition integer after the final marker must agree
+between the field directory and every tile. Digits intrinsic to `BiVe3`,
+`BiVe4`, `ASCL1`, and multi-token markers such as `NKX2_1` remain part of their
+marker names.
+
+Physical IMS channel count, indices, and stored names are checked across all
+four tiles. A phase channel or a mismatch between physical channel count and
+filename biological markers fails before processing. In particular, a
+five-channel phase-plus-DAPI/GFP/LHX6/PV acquisition is rejected; the wrapper
+never fabricates `Set3` as a fifth marker. Partial phase-channel export is not
+implemented here.
+
+Source tile IDs need not start at zero. Four complete tiles are sorted by their
+numeric IDs and staged as `F00`–`F03`; both identities remain in the manifest.
+Incomplete fields are skipped and listed in `skipped_fields.csv`. Extra,
+duplicate, ambiguous, or inconsistent inputs remain fatal.
+
+## Preserved scientific configuration
+
+`configs/ims_mge_generic.example.json` remains the production configuration.
+It preserves native IMS resolution and voxel calibration,
+`analysis_downsampling.factor=1`, 2×2 stitching, existing BaSiC and BigStitcher
+parameters, CellProfiler segmentation and shared DAPI mask, ROI filters,
+matching, colocalization, and report generation.
+
+IGF registration remains exactly:
 
 ```text
 --skip-phase-init --match-gate-um 25 --iterations 5 --max-points 1500
 ```
 
-The example otherwise preserves the supplied IMS export, BaSiC, BigStitcher,
-CellProfiler, ROI-filtering, and colocalization settings.
-
-## Scan without writing
-
-From the repository checkout:
-
-```bash
-python "IGF Organoids/run_folder_batch.py" scan \
-  --input "$IMS_INPUT" \
-  --spec "IGF Organoids/configs/ims_mge_generic.example.json"
-```
-
-Review every field, original tile order, staged order, and detected channel
-mapping. `scan` does not create files.
-
-Useful selectors include:
-
-```text
---group 'Exp17_157-2_Set2*'
---field 1 --field 3
---max-depth 6
---require-contiguous
-```
-
-## Prepare and inspect the Slurm command
-
-Use `--print-only` first. It creates the scratch workspace and manifests, but
-does not call `sbatch`:
-
-```bash
-python "IGF Organoids/submit_folder_batch.py" \
-  --input "$IMS_INPUT" \
-  --spec "IGF Organoids/configs/ims_mge_generic.example.json" \
-  --workspace "$IGF_WORKSPACE" \
-  --max-parallel 2 \
-  --print-only
-```
-
-Preparation creates:
-
-```text
-manifest.json
-skipped_fields.csv
-controller_compat/
-input_staging/
-configs/
-logs/
-outputs/
-```
-
-`controller_compat` is intentional and must remain. The upstream IMS entry
-points call `Path.resolve()`, which would dereference a staged `F00` link back
-to a differently numbered source tile before validating tile order. The
-adapter changes only those path-canonicalization calls to `Path.absolute()`.
-It symlinks the unmodified downstream runner and TIFF-safety module; it does not
-change any scientific algorithm.
-
-## Submit
-
-Because preparation requires a new empty workspace, submit the already prepared
-manifest after reviewing the print-only command:
-
-```bash
-python "IGF Organoids/submit_folder_batch.py" \
-  --manifest "$IGF_WORKSPACE/manifest.json" \
-  --max-parallel 2
-```
-
-Each array task processes exactly one biological `Field_N` acquisition. The
-parallel limit controls how many full field jobs run concurrently. The helper
-records the Slurm job ID in `slurm_submission.json` and refuses accidental
-duplicate submissions.
-
-Monitor with the printed job ID:
-
-```bash
-squeue -j JOB_ID
-sacct -j JOB_ID --format=JobID,State,ExitCode,Elapsed,MaxRSS
-tail -F "$IGF_WORKSPACE/logs/ims_JOB_ID_0.out"
-tail -F "$IGF_WORKSPACE/logs/ims_JOB_ID_0.err"
-```
-
-## Resume and status
-
-The Slurm runner always requests `--resume`. Existing stage manifests are
-checked before outputs are reused, and source IMS size and modification time
-must still match the preparation manifest.
-
-```bash
-python "IGF Organoids/run_folder_batch.py" inspect \
-  --manifest "$IGF_WORKSPACE/manifest.json"
-```
-
-After confirming an earlier job has ended, an intentional resubmission is:
-
-```bash
-python "IGF Organoids/submit_folder_batch.py" \
-  --manifest "$IGF_WORKSPACE/manifest.json" \
-  --max-parallel 2 \
-  --allow-duplicate
-```
-
-## CASTalign changes from the repository baseline
-
-The supplied working Great Lakes versions of
-`Alignment/CASTalign_two_channel_registration.py` and
-`run_stitched_pipeline.py` are used directly.
-
-The relevant changes are narrowly scoped:
-
-1. The old early error requiring identical fixed and moving XY dimensions was
-   removed from CASTalign.
-2. The stitched runner accepts unequal native dimensions only when alignment is
-   enabled. Alignment-disabled workflows still require one common XY canvas.
-3. If phase correlation is enabled elsewhere, unequal images are temporarily
-   zero-padded on the bottom and right to a common size only for that coarse
-   initializer. Source images and centroid coordinate systems are unchanged.
-4. IGF sets `--skip-phase-init`, so no phase-correlation call or padding occurs
-   for this workflow; the initial translation is zero.
-5. The final moving image is transformed once onto the fixed nuclear image's
-   output dimensions.
-6. The existing five-iteration transformation behavior is unchanged.
-
-Phase correlation was therefore disabled for IGF, not deleted from the general
-CASTalign command. This keeps other existing workflows backward-compatible.
-
-## Intentional differences from the supplied Great Lakes wrapper
-
-Repository integration required only these non-scientific changes:
-
-- the three batch files and example configuration live under `IGF Organoids/`;
-- their default repository root is the parent of this directory;
-- the hardcoded `/home/oltij/ImageAnalysisScripts-Copy` Slurm path is replaced
-  by absolute runner paths recorded in the manifest and passed as job arguments;
-- the optional directory/filename acquisition identifiers are explicitly
-  cross-validated;
-- the successful phase-disabled CASTalign arguments are present in the example;
-- documentation and focused regression tests were added.
-
-The supplied CASTalign and stitched-pipeline Python files themselves are
-otherwise reproduced exactly. No IMS export, BaSiC, BigStitcher, CellProfiler,
-ROI-filtering, or colocalization algorithm was rewritten.
+CASTalign's existing five-iteration behavior is unchanged. The previous early
+equal-dimension rejection remains removed: when alignment is enabled, markers
+with different native stitched XY canvases are registered onto the fixed DAPI
+canvas. Phase correlation is disabled for IGF, not deleted from the general
+CASTalign tool.
