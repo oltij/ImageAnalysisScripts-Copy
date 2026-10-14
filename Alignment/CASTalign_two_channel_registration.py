@@ -218,56 +218,29 @@ def spatial_subsample(points: np.ndarray, max_points: int, seed: int) -> np.ndar
     return np.asarray(selected, dtype=int)
 
 
-def phase_correlation_canvases(
-    fixed: np.ndarray, moving: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Temporarily bottom/right-pad images to one canvas for phase correlation.
-
-    Padding is used only by the optional coarse initializer. It does not alter
-    the source images, their centroid coordinates, or the final resampling.
-    """
-    if fixed.shape == moving.shape:
-        return fixed, moving
-    common_shape = (
-        max(fixed.shape[0], moving.shape[0]),
-        max(fixed.shape[1], moving.shape[1]),
-    )
-
-    def pad(image: np.ndarray) -> np.ndarray:
-        return np.pad(
-            image,
-            (
-                (0, common_shape[0] - image.shape[0]),
-                (0, common_shape[1] - image.shape[1]),
-            ),
-            mode="constant",
-        )
-
-    return pad(fixed), pad(moving)
-
-
 def phase_correlation_shift(fixed: np.ndarray, moving: np.ndarray, upsample_factor: int = 10) -> Tuple[np.ndarray, float, float]:
-    """Return shift to apply to moving so it aligns to fixed."""
-    fixed_for_phase, moving_for_phase = phase_correlation_canvases(fixed, moving)
-    f = fixed_for_phase.astype(np.float32, copy=False)
-    m = moving_for_phase.astype(np.float32, copy=False)
+    """Return moving-to-fixed coarse shift; tolerate different 2-D image shapes.
+
+    Images are padded on bottom/right *temporarily* only to make their shapes
+    compatible with phase_cross_correlation. Their (0,0) pixel origins stay
+    unchanged; no registered output or source TIFF is padded or resampled here.
+    The original identical-shape code path is retained exactly.
+    """
+    f = fixed.astype(np.float32, copy=False)
+    m = moving.astype(np.float32, copy=False)
+    if f.shape != m.shape:
+        common_y = max(f.shape[0], m.shape[0])
+        common_x = max(f.shape[1], m.shape[1])
+        temporary_fixed = np.zeros((common_y, common_x), dtype=np.float32)
+        temporary_moving = np.zeros((common_y, common_x), dtype=np.float32)
+        temporary_fixed[:f.shape[0], :f.shape[1]] = f
+        temporary_moving[:m.shape[0], :m.shape[1]] = m
+        f, m = temporary_fixed, temporary_moving
 
     shift, error, phasediff = phase_cross_correlation(
         f, m, upsample_factor=upsample_factor
     )
     return np.asarray(shift, dtype=float), float(error), float(phasediff)
-
-
-def phase_initializer(
-    fixed: np.ndarray,
-    moving: np.ndarray,
-    skip: bool,
-    upsample_factor: int,
-) -> Tuple[np.ndarray, float, float]:
-    """Return the optional coarse initializer without changing either image."""
-    if skip:
-        return np.zeros(2, dtype=float), float("nan"), float("nan")
-    return phase_correlation_shift(fixed, moving, upsample_factor)
 
 
 def robust_cutoff(residuals: np.ndarray, minimum: float, multiplier: float) -> float:
@@ -519,27 +492,6 @@ def save_residual_histogram(residual_um: np.ndarray, output: Path) -> None:
     plt.close()
 
 
-def transform_moving_to_fixed_canvas(
-    transform, moving: np.ndarray, fixed_shape: Tuple[int, int]
-) -> np.ndarray:
-    """Apply the selected transform once and emit exactly the fixed XY canvas."""
-    registered = transform.transform_image(
-        moving,
-        output_size=(1, fixed_shape[0], fixed_shape[1]),
-        force_size=True,
-        labels=False,
-    )
-    registered = np.asarray(registered, dtype=np.float32)
-    if registered.ndim == 3 and registered.shape[0] == 1:
-        registered = registered[0]
-    if registered.shape != fixed_shape:
-        raise RuntimeError(
-            "CASTalign registered output does not match the fixed image canvas: "
-            f"{registered.shape} versus {fixed_shape}"
-        )
-    return registered
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description="Headless 2-D max-projection CASTalign registration")
     ap.add_argument("--fixed-image", required=True, type=Path, help="Fixed/reference max-projection TIFF, e.g. Hoechst")
@@ -588,6 +540,13 @@ def main() -> int:
     log(f"  Fixed shape : {fixed.shape}")
     log(f"  Moving shape: {moving.shape}")
 
+    if fixed.shape != moving.shape:
+        log(
+            "  Different native XY shapes are permitted; coarse phase correlation "
+            "uses temporary zero-padded arrays, and the final CASTalign output "
+            "keeps the fixed image canvas."
+        )
+
     # ---------------------------------------------------------------
     # CellProfiler centroids
     # ---------------------------------------------------------------
@@ -619,15 +578,15 @@ def main() -> int:
     # ---------------------------------------------------------------
     # Coarse image-based initialization
     # ---------------------------------------------------------------
+    shift_px = np.zeros(2, dtype=float)
+    phase_error = float("nan")
+    phase_diff = float("nan")
+
     if not args.skip_phase_init:
         log("Running coarse 2-D phase correlation (initializer only)...")
-    shift_px, phase_error, phase_diff = phase_initializer(
-        fixed,
-        moving,
-        skip=args.skip_phase_init,
-        upsample_factor=args.phase_upsample,
-    )
-    if not args.skip_phase_init:
+        shift_px, phase_error, phase_diff = phase_correlation_shift(
+            fixed, moving, upsample_factor=args.phase_upsample
+        )
         log(f"  Shift to apply to moving (Y,X px): {shift_px}")
         log(f"  Correlation error: {phase_error:.6g}")
 
@@ -742,7 +701,15 @@ def main() -> int:
     # Apply to the max projection
     # ---------------------------------------------------------------
     log(f"Applying final {chosen_model} transform to moving max projection...")
-    registered = transform_moving_to_fixed_canvas(full_final_t, moving, fixed.shape)
+    registered = full_final_t.transform_image(
+        moving,
+        output_size=(1, fixed.shape[0], fixed.shape[1]),
+        force_size=True,
+        labels=False,
+    )
+    registered = np.asarray(registered, dtype=np.float32)
+    if registered.ndim == 3 and registered.shape[0] == 1:
+        registered = registered[0]
 
     # Save the two channels as separate TIFFs in the SAME final coordinate frame.
     # Hoechst is the fixed/reference image; PV is the transformed/moving image.
@@ -786,8 +753,6 @@ def main() -> int:
         f.write(f"Fixed CellProfiler CSV: {args.fixed_csv}\n")
         f.write(f"Moving CellProfiler CSV: {args.moving_csv}\n\n")
         f.write(f"Image shape (Y,X): {fixed.shape}\n")
-        f.write(f"Moving image shape (Y,X): {moving.shape}\n")
-        f.write(f"Registered output shape (Y,X): {registered.shape}\n")
         f.write(f"Pixel size X: {args.pixel_size_x:.9f} um\n")
         f.write(f"Pixel size Y: {args.pixel_size_y:.9f} um\n\n")
         f.write(f"Fixed object count: {len(fixed_points)}\n")

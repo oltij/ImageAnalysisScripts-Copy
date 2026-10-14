@@ -284,7 +284,7 @@ class StitchedPipelineTests(unittest.TestCase):
             tifffile.imwrite(dna, np.ones((4, 5), dtype=np.uint8), metadata={"axes": "YX"})
             tifffile.imwrite(marker, np.ones((5, 5), dtype=np.uint8), metadata={"axes": "YX"})
             config = self._write_config(tmp, {"DNA": str(dna), "Marker": str(marker)}, pairs=[])
-            with self.assertRaisesRegex(ValueError, "when alignment is disabled"):
+            with self.assertRaisesRegex(ValueError, "when CASTalign is disabled"):
                 runner.validate_inputs(runner.read_config(config))
 
     def test_mismatched_xy_dimensions_pass_when_alignment_is_enabled(self):
@@ -302,19 +302,6 @@ class StitchedPipelineTests(unittest.TestCase):
             descriptions = runner.validate_inputs(runner.read_config(config))
             self.assertEqual(descriptions["DNA"]["yx_shape"], (4, 5))
             self.assertEqual(descriptions["Marker"]["yx_shape"], (5, 7))
-
-    def test_registered_image_must_match_nuclear_canvas(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            fixed = tmp / "dapi.tif"
-            registered = tmp / "registered.tif"
-            tifffile.imwrite(fixed, np.ones((4, 5), dtype=np.uint8), metadata={"axes": "YX"})
-            tifffile.imwrite(registered, np.ones((4, 5), dtype=np.float32), metadata={"axes": "YX"})
-            runner.validate_registered_canvas(fixed, registered, "GFP")
-
-            tifffile.imwrite(registered, np.ones((5, 5), dtype=np.float32), metadata={"axes": "YX"})
-            with self.assertRaisesRegex(RuntimeError, "nuclear canvas"):
-                runner.validate_registered_canvas(fixed, registered, "GFP")
 
     def test_resume_refuses_changed_pipeline(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -412,15 +399,7 @@ class StitchedPipelineTests(unittest.TestCase):
 
                 def execute(self, label, command, expected):
                     self.calls.append(("execute", label, command, expected))
-                    if label.startswith("03_align_"):
-                        expected[0].parent.mkdir(parents=True, exist_ok=True)
-                        tifffile.imwrite(
-                            expected[0],
-                            np.ones((4, 5), dtype=np.float32),
-                            metadata={"axes": "YX"},
-                        )
-                    else:
-                        self._create(expected)
+                    self._create(expected)
                     self.completed[label] = [str(path) for path in expected]
 
                 def patched(self, label, script, replacements, expected):

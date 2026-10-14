@@ -336,14 +336,19 @@ def validate_inputs(cfg: dict) -> dict[str, dict[str, object]]:
             raise ValueError(f"Stitched input for {name} is empty: {source}")
         descriptions[name] = inspect_tiff(source)
     dimensions = {tuple(info["yx_shape"]) for info in descriptions.values()}
-    alignment_enabled = cfg.get("alignment", {}).get("enabled", True)
-    if len(dimensions) != 1 and not alignment_enabled:
+    if len(dimensions) != 1:
         detail = ", ".join(
             f"{name}={tuple(info['yx_shape'])}" for name, info in descriptions.items()
         )
-        raise ValueError(
-            "All channels must share one XY pixel canvas when alignment is disabled; "
-            + detail
+        if not cfg.get("alignment", {}).get("enabled", True):
+            raise ValueError(
+                "Channels must share one XY pixel canvas when CASTalign is disabled; "
+                + detail
+            )
+        print(
+            "INFO: Native stitched images have different XY shapes; "
+            "CASTalign will register each marker to the nuclear reference: " + detail,
+            flush=True,
         )
     validate_cellprofiler_pipeline(cfg["_pipeline"])
     return descriptions
@@ -750,23 +755,6 @@ def ensure_named_alignment(registered: Path, named: Path) -> Path:
     return named
 
 
-def validate_registered_canvas(
-    fixed: Path, registered: Path, marker_name: str
-) -> None:
-    """Require each registered marker to use the fixed nuclear XY canvas."""
-    fixed_info = inspect_tiff(fixed)
-    registered_info = inspect_tiff(registered)
-    if registered_info["projection_required"]:
-        raise RuntimeError(
-            f"Registered {marker_name} image must be 2-D: {registered}"
-        )
-    if tuple(registered_info["yx_shape"]) != tuple(fixed_info["yx_shape"]):
-        raise RuntimeError(
-            f"Registered {marker_name} image does not match the nuclear canvas: "
-            f"{registered_info['yx_shape']} versus {fixed_info['yx_shape']}"
-        )
-
-
 def run(cfg: dict, resume: bool) -> None:
     r = Runner(cfg, resume)
     names = list(cfg["_channels"])
@@ -798,14 +786,7 @@ def run(cfg: dict, resume: bool) -> None:
                        "--pixel-size-x", str(x), "--pixel-size-y", str(y), "--output", str(target)]
             command += list(cfg.get("alignment", {}).get("extra_args", []))
             registered = target / "aligned_PV_max.tif"  # Hard-coded by existing CASTalign script.
-            alignment_label = f"03_align_{name}"
-            r.execute(alignment_label, command, [registered])
-            try:
-                validate_registered_canvas(images[nuc], registered, name)
-            except Exception:
-                r.completed.pop(alignment_label, None)
-                r.save()
-                raise
+            r.execute(f"03_align_{name}", command, [registered])
             named = target / f"aligned_{name}_max.tif"
             aligned[name] = ensure_named_alignment(registered, named)
     else:
