@@ -276,7 +276,7 @@ class StitchedPipelineTests(unittest.TestCase):
             np.testing.assert_array_equal(tifffile.imread(result), stack.max(axis=0))
             self.assertEqual(runner.inspect_tiff(result)["axes"], "YX")
 
-    def test_mismatched_xy_dimensions_fail_preflight(self):
+    def test_mismatched_xy_dimensions_fail_when_alignment_is_disabled(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             dna = tmp / "dna.tif"
@@ -284,8 +284,37 @@ class StitchedPipelineTests(unittest.TestCase):
             tifffile.imwrite(dna, np.ones((4, 5), dtype=np.uint8), metadata={"axes": "YX"})
             tifffile.imwrite(marker, np.ones((5, 5), dtype=np.uint8), metadata={"axes": "YX"})
             config = self._write_config(tmp, {"DNA": str(dna), "Marker": str(marker)}, pairs=[])
-            with self.assertRaisesRegex(ValueError, "one XY pixel canvas"):
+            with self.assertRaisesRegex(ValueError, "when alignment is disabled"):
                 runner.validate_inputs(runner.read_config(config))
+
+    def test_mismatched_xy_dimensions_pass_when_alignment_is_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            dna = tmp / "dna.tif"
+            marker = tmp / "marker.tif"
+            tifffile.imwrite(dna, np.ones((4, 5), dtype=np.uint8), metadata={"axes": "YX"})
+            tifffile.imwrite(marker, np.ones((5, 7), dtype=np.uint8), metadata={"axes": "YX"})
+            config = self._write_config(tmp, {"DNA": str(dna), "Marker": str(marker)}, pairs=[])
+            raw = json.loads(config.read_text(encoding="utf-8"))
+            raw["alignment"]["enabled"] = True
+            config.write_text(json.dumps(raw), encoding="utf-8")
+
+            descriptions = runner.validate_inputs(runner.read_config(config))
+            self.assertEqual(descriptions["DNA"]["yx_shape"], (4, 5))
+            self.assertEqual(descriptions["Marker"]["yx_shape"], (5, 7))
+
+    def test_registered_image_must_match_nuclear_canvas(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            fixed = tmp / "dapi.tif"
+            registered = tmp / "registered.tif"
+            tifffile.imwrite(fixed, np.ones((4, 5), dtype=np.uint8), metadata={"axes": "YX"})
+            tifffile.imwrite(registered, np.ones((4, 5), dtype=np.float32), metadata={"axes": "YX"})
+            runner.validate_registered_canvas(fixed, registered, "GFP")
+
+            tifffile.imwrite(registered, np.ones((5, 5), dtype=np.float32), metadata={"axes": "YX"})
+            with self.assertRaisesRegex(RuntimeError, "nuclear canvas"):
+                runner.validate_registered_canvas(fixed, registered, "GFP")
 
     def test_resume_refuses_changed_pipeline(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -324,7 +353,18 @@ class StitchedPipelineTests(unittest.TestCase):
                 tmp, channels, output="analysis", pairs=[["LHX6", "PV"]]
             )
             raw = json.loads(config_path.read_text(encoding="utf-8"))
-            raw["alignment"]["enabled"] = True
+            raw["alignment"] = {
+                "enabled": True,
+                "extra_args": [
+                    "--skip-phase-init",
+                    "--match-gate-um",
+                    "25",
+                    "--iterations",
+                    "5",
+                    "--max-points",
+                    "1500",
+                ],
+            }
             raw["reports"] = {
                 "organoid_mask": True,
                 "intensity": True,
@@ -372,7 +412,15 @@ class StitchedPipelineTests(unittest.TestCase):
 
                 def execute(self, label, command, expected):
                     self.calls.append(("execute", label, command, expected))
-                    self._create(expected)
+                    if label.startswith("03_align_"):
+                        expected[0].parent.mkdir(parents=True, exist_ok=True)
+                        tifffile.imwrite(
+                            expected[0],
+                            np.ones((4, 5), dtype=np.float32),
+                            metadata={"axes": "YX"},
+                        )
+                    else:
+                        self._create(expected)
                     self.completed[label] = [str(path) for path in expected]
 
                 def patched(self, label, script, replacements, expected):
@@ -438,6 +486,13 @@ class StitchedPipelineTests(unittest.TestCase):
             self.assertEqual(
                 calls_by_label["04_aligned_cp_PV"][4], reference_mask
             )
+            expected_alignment_args = raw["alignment"]["extra_args"]
+            for marker in ("LHX6", "PV"):
+                alignment_command = calls_by_label[f"03_align_{marker}"][2]
+                self.assertEqual(
+                    alignment_command[-len(expected_alignment_args):],
+                    expected_alignment_args,
+                )
             qc_command = calls_by_label["04_organoid_mask_qc"][2]
             self.assertEqual(
                 Path(qc_command[qc_command.index("--reference-mask") + 1]),

@@ -27,7 +27,7 @@ Supply one single-channel TIFF for every entry in `channels`. Supported layouts 
 - two-dimensional `YX`; or
 - a three-dimensional page stack reported by `tifffile` as `ZYX`, `QYX`, or `IYX`.
 
-The runner max-projects accepted 3-D stacks across the first axis. RGB, multichannel, time-series, and ambiguous hyperstacks are rejected. Every channel must have the same final XY pixel dimensions. The images must depict the same organoid and, when alignment is disabled, must already use the same pixel coordinate frame.
+The runner max-projects accepted 3-D stacks across the first axis. RGB, multichannel, time-series, and ambiguous hyperstacks are rejected. When alignment is enabled, independently stitched channels may have slightly different native XY dimensions; CASTalign writes each registered marker on the nuclear-reference canvas. When alignment is disabled, every channel must already have the same XY dimensions and pixel coordinate frame. All images must depict the same organoid.
 
 Copy and edit the example:
 
@@ -63,7 +63,7 @@ python run_stitched_pipeline.py --config stitched_pipeline.json --dry-run
 python run_stitched_pipeline.py --config stitched_pipeline.json
 ```
 
-The dry run parses the complete configuration, verifies the `.cppipe`, reads every TIFF's metadata, checks axes and shared XY dimensions, and prints the exact channel/pair plan. It does not create the output directory or test installed environments.
+The dry run parses the complete configuration, verifies the `.cppipe`, reads every TIFF's metadata, checks axes and the alignment-dependent XY-canvas requirements, and prints the exact channel/pair plan. It does not create the output directory or test installed environments.
 
 Execution additionally checks the active environment's Python dependencies and verifies that `cellprofiler` imports through the configured Conda environment. CellProfiler is invoked with `conda run`, so no manual environment switching is required mid-run.
 

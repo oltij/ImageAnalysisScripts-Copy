@@ -238,15 +238,16 @@ TIFF
 2-D after squeeze
 ```
 
-### Required shape
+### Image canvas
 
-The script currently requires:
+Fixed and moving images may have different native XY dimensions. Their pixels
+and centroid coordinates remain in their original coordinate systems. The
+final moving image is resampled once onto the fixed image's XY canvas.
 
-```text
-fixed.shape == moving.shape
-```
-
-The preliminary implementation does not accept different coordinate-box dimensions.
+If phase correlation is enabled for unequal images, the script temporarily
+zero-pads their bottom and right edges to a common array size only for that
+coarse initializer. `--skip-phase-init` uses a zero initial translation and
+does not create padded arrays or call phase correlation.
 
 ---
 
@@ -373,6 +374,10 @@ Units are µm/pixel.
 ### Phase-correlation initializer
 
 Enabled by default.
+
+For unequal native canvases, temporary bottom/right zero-padding is used only
+inside this initializer. It does not alter either source image or its centroid
+coordinates.
 
 Disable with:
 

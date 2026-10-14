@@ -1,0 +1,51 @@
+{
+  "_required_edit": "Copy pixel size, thresholds, and both filter objects from the successful Great Lakes configuration before running.",
+  "nuclear_channel": "DAPI",
+  "channels": {
+    "DAPI": "/path/to/independently_stitched_DAPI_max_projection.tif",
+    "GFP": "/path/to/independently_stitched_GFP_max_projection.tif",
+    "LHX6": "/path/to/independently_stitched_LHX6_max_projection.tif",
+    "PV": "/path/to/independently_stitched_PV_max_projection.tif"
+  },
+  "output_dir": "/path/to/new/igf_analysis_output",
+  "pixel_size_um": {
+    "x": null,
+    "y": null
+  },
+  "cellprofiler": {
+    "pipeline": "CellProfiler/MGEOPVFinal.cppipe",
+    "conda_env": "cellprofiler-native",
+    "conda_executable": "conda"
+  },
+  "alignment": {
+    "enabled": true,
+    "extra_args": [
+      "--skip-phase-init",
+      "--match-gate-um",
+      "25",
+      "--iterations",
+      "5",
+      "--max-points",
+      "1500"
+    ]
+  },
+  "pairs": [
+    ["GFP", "LHX6"],
+    ["GFP", "PV"],
+    ["LHX6", "PV"]
+  ],
+  "thresholds": {
+    "marker_nuclear": null,
+    "marker_marker": null
+  },
+  "filters": {
+    "intensity": "REPLACE_WITH_TESTED_INTENSITY_FILTER_OBJECT",
+    "shape": "REPLACE_WITH_TESTED_SHAPE_FILTER_OBJECT"
+  },
+  "reports": {
+    "organoid_mask": true,
+    "intensity": true,
+    "shape": true,
+    "colocalization": true
+  }
+}
