@@ -1,5 +1,12 @@
 # IGF organoid IMS folder batch
 
+This is the production-specific application for the audited IGF experiment.
+Independent datasets should start with the
+[`GeneralPipeline` documentation](../GeneralPipeline/README.md). The general
+interface is additive: these IGF entry points, paths, run plan, and scientific
+configuration remain unchanged so existing production manifests and submitted
+jobs continue to use the committed implementation that created them.
+
 This directory contains the production Great Lakes orchestration around the
 repository's existing microscopy pipeline. It starts from each field's four
 original `.ims` tiles and runs the established workflow:

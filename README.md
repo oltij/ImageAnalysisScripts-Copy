@@ -1,5 +1,46 @@
 # General Image-Analysis Pipeline
 
+## Choose the input you actually have
+
+The experiment-independent interface is
+[`GeneralPipeline/run_pipeline.py`](GeneralPipeline/run_pipeline.py). It
+supports two primary, independently validated starting points:
+
+1. **Original tiled IMS acquisitions** (`raw_ims_tiles`): recursively discover
+   complete four-tile 2×2 fields, validate biological and physical channels,
+   stage read-only symlinks, then run IMS export, BaSiC, BigStitcher, and the
+   shared downstream analysis.
+2. **Channel TIFFs already stitched in Imaris** (`stitched_tiffs`): require an
+   explicit sample/channel mapping or a deterministic named filename rule,
+   validate YX/ZYX TIFFs and explicit pixel calibration, bypass IMS/BaSiC/
+   BigStitcher, and enter the same downstream analysis.
+
+```bash
+# A. Original raw IMS tiles
+python GeneralPipeline/run_pipeline.py scan \
+  --mode raw_ims_tiles --input /path/to/experiments \
+  --config /path/to/raw_ims.json
+
+# B. Imaris-stitched channel TIFFs
+python GeneralPipeline/run_pipeline.py scan \
+  --mode stitched_tiffs --input /path/to/stitched_tiffs \
+  --config /path/to/stitched_tiffs.json
+```
+
+Read [`GeneralPipeline/README.md`](GeneralPipeline/README.md) for preparation,
+preflight, execution, Slurm submission, resume, exact mapping rules, safety,
+and supported formats. Both routes converge on `run_stitched_pipeline.py`;
+the scientific registration, segmentation, masking, filtering, matching,
+colocalization, and QC implementations are not duplicated.
+
+The preserved `run_ims_pipeline.py` route for an IMS file already stitched in
+Imaris still has a fixed Hoechst/mNeonGreen/BiVe3-or-BiVe4/PV mapping. See
+[`IMS_WORKFLOW.md`](IMS_WORKFLOW.md); it is not yet a general variable-panel
+mode.
+
+The production-specific 94-field workflow remains separately documented in
+[`IGF Organoids/README.md`](IGF%20Organoids/README.md).
+
 ---
 
 ## Overview
@@ -8,9 +49,9 @@ This README describes the end-to-end workflow for a tiled microscopy acquisition
 
 The document is organized around **eight pipeline steps**. Those eight steps are the authoritative processing order. The four larger phases describe what the pipeline is doing conceptually; they do **not** add extra processing steps.
 
-### Run the complete workflow from IMS files
+### Legacy fixed-reporter IMS controller
 
-`run_ims_pipeline.py` is the complete entry point when the source data are `.ims` files. It supports both `_F00.ims`…`_F03.ims` mosaic fields and one IMS file already stitched in Imaris. It assigns channel indices 0–3 to Hoechst, mNeonGreen, BiVe3/BiVe4 virus, and PV; resolves the virus label separately for each organoid; records Imaris names/wavelength metadata; retains full-resolution projections; creates explicitly configured area-mean analysis projections with automatically adjusted calibration; and then invokes every downstream stage automatically.
+`run_ims_pipeline.py` is preserved for the fixed four-reporter workflow. It supports both `_F00.ims`…`_F03.ims` mosaic fields and one IMS file already stitched in Imaris. It assigns channel indices 0–3 to Hoechst, mNeonGreen, BiVe3/BiVe4 virus, and PV; resolves the virus label separately for each organoid; records Imaris names/wavelength metadata; retains full-resolution projections; creates explicitly configured area-mean analysis projections with automatically adjusted calibration; and then invokes every downstream stage automatically. For variable panels and recursive field discovery, use `GeneralPipeline/` above.
 
 IMS preprocessing writes TIFF intermediates through validated temporary files
 and atomic renames. Resume checks TIFF structure, dimensions, data type, and

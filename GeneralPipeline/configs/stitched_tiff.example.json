@@ -1,0 +1,76 @@
+{
+  "input_mode": "stitched_tiffs",
+  "channel_names": [
+    "DAPI",
+    "GFP",
+    "LHX6"
+  ],
+  "nuclear_channel": "DAPI",
+  "pixel_size_um": {
+    "x": "REPLACE_WITH_TRUSTWORTHY_PIXEL_SIZE_UM",
+    "y": "REPLACE_WITH_TRUSTWORTHY_PIXEL_SIZE_UM"
+  },
+  "stitched_tiffs": {
+    "mapping": {
+      "samples": [
+        {
+          "name": "sample_001",
+          "channels": {
+            "DAPI": "sample_001_DAPI.tif",
+            "GFP": "sample_001_GFP.tif",
+            "LHX6": "sample_001_LHX6.tif"
+          }
+        }
+      ]
+    }
+  },
+  "analysis": {
+    "cellprofiler": {
+      "pipeline": "CellProfiler/MGEOPVFinal.cppipe",
+      "conda_env": "cellprofiler-native",
+      "conda_executable": "conda"
+    },
+    "alignment": {
+      "enabled": true,
+      "extra_args": [
+        "--skip-phase-init",
+        "--match-gate-um",
+        "25",
+        "--iterations",
+        "5",
+        "--max-points",
+        "1500"
+      ]
+    },
+    "pairs": [
+      [
+        "GFP",
+        "LHX6"
+      ]
+    ],
+    "thresholds": {
+      "marker_nuclear": 0.25,
+      "marker_marker": 0.25
+    },
+    "filters": {
+      "intensity": {
+        "Mean intensity": {
+          "percentile": 0,
+          "keep": "above"
+        }
+      },
+      "shape": {
+        "Area_um2": {
+          "percentile": 0,
+          "keep": "above"
+        }
+      }
+    },
+    "reports": {
+      "organoid_mask": true,
+      "intensity": true,
+      "shape": true,
+      "colocalization": true
+    }
+  }
+}
