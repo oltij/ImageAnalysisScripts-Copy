@@ -504,6 +504,12 @@ class GeneralPipelinePreparationTests(unittest.TestCase):
             self.assertTrue(
                 (workspace / "controller_compat/run_ims_pipeline.py").is_file()
             )
+            raw_command = batch_runner._raw_preflight(
+                job,
+                json.loads(Path(job["config_path"]).read_text(encoding="utf-8")),
+                Path(payload["compat_repository"]),
+            )
+            self.assertIn("--cleanup-stitching-intermediates", raw_command)
             self.assertEqual({path: sha256(path) for path in paths}, before)
             summary = manifest_module.validate_manifest(payload)
             self.assertEqual(summary["sources_checked"], 4)

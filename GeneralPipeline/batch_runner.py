@@ -78,6 +78,7 @@ def _raw_preflight(
         "--intensity-unmodified",
         str(stitch.get("intensity_unmodified", 0.5)),
         "--keep-previous",
+        "--cleanup-stitching-intermediates",
     ]
     if not config["trim_zero_padding"]:
         command.append("--no-trim-zero-padding")

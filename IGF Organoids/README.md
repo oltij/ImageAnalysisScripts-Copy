@@ -21,6 +21,19 @@ original `.ims` tiles and runs the established workflow:
 
 The wrappers do not replace, optimize, or change those scientific algorithms.
 
+For newly prepared batches, BigStitcher's multiresolution backing data are
+cleaned per channel by default after the stable stitched TIFF and maximum
+projection both validate. The current macro produces `dataset*.h5`, and the
+same guarded cleanup recognizes Zarr/N5 backing directories. Failed stitching
+or projection retains those intermediates for diagnosis. Exported TIFFs,
+BaSiC-corrected TIFFs, stitched TIFFs, projections, `dataset.xml`, macros, and
+logs are retained; original Turbo `.ims` files are never cleanup targets.
+
+Prepared production workspaces are commit-pinned and contain controller
+compatibility copies. Do not edit those copies or pull a new repository commit
+under an active manifest. Prepare a fresh scratch workspace from the cleanup
+commit to apply this default to a new set of remaining acquisitions.
+
 ## Committed files
 
 - `run_folder_batch.py`: session-scoped discovery, metadata validation, scratch

@@ -281,6 +281,126 @@ class IMSPipelineTests(unittest.TestCase):
                 )
             )
 
+    def test_stitching_backing_data_cleanup_is_enabled_by_default(self):
+        mosaic = load_mosaic_module(ims.ROOT)
+        parser = mosaic.build_parser()
+        default = parser.parse_args(["input", "--fiji-sif", "fiji.sif"])
+        retained = parser.parse_args(
+            [
+                "input",
+                "--fiji-sif",
+                "fiji.sif",
+                "--keep-stitching-intermediates",
+            ]
+        )
+        self.assertTrue(default.cleanup_stitching_intermediates)
+        self.assertFalse(retained.cleanup_stitching_intermediates)
+
+    def test_completed_stitching_backing_data_are_removed_safely(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            mosaic = load_mosaic_module(ims.ROOT)
+            channel = tmp / "03_stitched/Hoechst"
+            channel.mkdir(parents=True)
+            fused = channel / "Hoechst_stitched.tif"
+            projection = tmp / "04_max_projections/Sample_Hoechst_stitched_max_projection.tif"
+            projection.parent.mkdir(parents=True)
+            volume = np.arange(3 * 5 * 6, dtype=np.float32).reshape(3, 5, 6)
+            tifffile.imwrite(
+                fused, volume, metadata={"axes": "ZYX"}, photometric="minisblack"
+            )
+            tifffile.imwrite(projection, np.max(volume, axis=0), metadata={"axes": "YX"})
+            dataset_xml = channel / "dataset.xml"
+            dataset_xml.write_text("<SpimData />", encoding="utf-8")
+            hdf5 = channel / "dataset.h5"
+            hdf5.write_bytes(b"BigStitcher HDF5 backing data")
+            zarr = channel / "dataset.ome.zarr"
+            (zarr / "0/0").mkdir(parents=True)
+            (zarr / "0/0/chunk").write_bytes(b"chunk")
+
+            removed = mosaic.cleanup_stitching_intermediates(fused, projection)
+
+            self.assertEqual(
+                {path.name for path in removed}, {"dataset.h5", "dataset.ome.zarr"}
+            )
+            self.assertFalse(hdf5.exists())
+            self.assertFalse(zarr.exists())
+            self.assertTrue(dataset_xml.is_file())
+            self.assertTrue(fused.is_file())
+            self.assertTrue(projection.is_file())
+            self.assertEqual(
+                mosaic.cleanup_stitching_intermediates(fused, projection), []
+            )
+
+    def test_invalid_projection_retains_stitching_backing_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            mosaic = load_mosaic_module(ims.ROOT)
+            channel = tmp / "03_stitched/Hoechst"
+            channel.mkdir(parents=True)
+            fused = channel / "Hoechst_stitched.tif"
+            projection = tmp / "04_max_projections/Sample_Hoechst_stitched_max_projection.tif"
+            projection.parent.mkdir(parents=True)
+            tifffile.imwrite(
+                fused,
+                np.zeros((3, 5, 6), dtype=np.float32),
+                metadata={"axes": "ZYX"},
+                photometric="minisblack",
+            )
+            tifffile.imwrite(
+                projection,
+                np.zeros((4, 6), dtype=np.float32),
+                metadata={"axes": "YX"},
+            )
+            (channel / "dataset.xml").write_text("<SpimData />", encoding="utf-8")
+            zarr = channel / "dataset.ome.zarr"
+            zarr.mkdir()
+
+            with self.assertRaisesRegex(ValueError, r"expected \(5, 6\)"):
+                mosaic.cleanup_stitching_intermediates(fused, projection)
+
+            self.assertTrue(zarr.is_dir())
+
+    def test_stitching_cleanup_refuses_symlinked_backing_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            mosaic = load_mosaic_module(ims.ROOT)
+            channel = tmp / "03_stitched/Hoechst"
+            channel.mkdir(parents=True)
+            fused = channel / "Hoechst_stitched.tif"
+            projection = tmp / "04_max_projections/Sample_Hoechst_stitched_max_projection.tif"
+            projection.parent.mkdir(parents=True)
+            volume = np.zeros((3, 5, 6), dtype=np.float32)
+            tifffile.imwrite(
+                fused, volume, metadata={"axes": "ZYX"}, photometric="minisblack"
+            )
+            tifffile.imwrite(projection, np.max(volume, axis=0), metadata={"axes": "YX"})
+            (channel / "dataset.xml").write_text("<SpimData />", encoding="utf-8")
+            external = tmp / "external_zarr"
+            external.mkdir()
+            zarr = channel / "dataset.ome.zarr"
+            zarr.symlink_to(external, target_is_directory=True)
+
+            with self.assertRaisesRegex(RuntimeError, "symlinked BigStitcher data"):
+                mosaic.cleanup_stitching_intermediates(fused, projection)
+
+            self.assertTrue(external.is_dir())
+            self.assertTrue(zarr.is_symlink())
+
+    def test_disabled_stitching_cleanup_retains_backing_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            mosaic = load_mosaic_module(ims.ROOT)
+            backing = tmp / "dataset.ome.zarr"
+            backing.mkdir()
+            removed = mosaic.cleanup_stitching_intermediates(
+                tmp / "missing_fused.tif",
+                tmp / "missing_projection.tif",
+                enabled=False,
+            )
+            self.assertEqual(removed, [])
+            self.assertTrue(backing.is_dir())
+
     def test_existing_mosaic_export_accepts_canonical_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)

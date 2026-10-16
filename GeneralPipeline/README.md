@@ -234,7 +234,9 @@ each marker onto the nuclear reference canvas before final segmentation.
 - `resume` executes one acquisition with provenance-checked resume. The raw
   preprocessing path uses the existing keep/validation behavior. IMS
   export/stitching and general-pipeline area-mean TIFF intermediates retain the
-  repository's atomic validated-write behavior.
+  repository's atomic validated-write behavior. For raw mosaics, validated
+  fused TIFFs and projections trigger default deletion of that channel's
+  BigStitcher HDF5/Zarr/N5 backing data; failed channels retain it.
 - `inspect` reports whether each downstream run manifest exists.
 - `submit` creates one Slurm array task per acquisition. `--print-only` never
   calls `sbatch`. A recorded submission blocks accidental duplicates.
@@ -242,6 +244,11 @@ each marker onto the nuclear reference canvas before final segmentation.
 All job ordering is deterministic. A resume is refused after source file
 statistics, configuration, Git revision, runner, or scientific code changes.
 Use a fresh workspace for changed inputs or parameters.
+
+The raw-IMS command records `--cleanup-stitching-intermediates` explicitly.
+Use the low-level stitcher option `--keep-stitching-intermediates` only when a
+reopenable BigStitcher dataset is more important than scratch space and inode
+usage.
 
 ## Workspace layout
 

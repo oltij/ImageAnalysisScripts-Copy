@@ -7,9 +7,13 @@ Example (four fields, Fiji/BigStitcher inside Singularity):
 
 Dependencies: Python 3.10+, h5py, numpy, tifffile.  For illumination
 correction install BaSiCPy: ``pip install basicpy``.  Fiji must have
-BigStitcher installed and up to date.  The program retains intermediates within the current run for auditability, but
-cleans the prior pipeline-generated result directory for the same acquisition
-before starting a new run. Use --keep-previous to preserve the old result.
+BigStitcher installed and up to date.  After each channel's fused TIFF and
+maximum projection have been validated, the program deletes BigStitcher's
+multiresolution backing data by default while retaining the XML, macro, log,
+fused TIFF, and projection. Use --keep-stitching-intermediates to retain the
+backing data. The program also cleans the prior pipeline-generated result
+directory for the same acquisition before starting a new run. Use
+--keep-previous to preserve the old result.
 """
 from __future__ import annotations
 
@@ -609,6 +613,111 @@ def max_project(source: Path, destination: Path, overwrite: bool) -> None:
     )
 
 
+def cleanup_stitching_intermediates(
+    fused: Path,
+    projection: Path,
+    *,
+    enabled: bool = True,
+) -> list[Path]:
+    """Remove BigStitcher backing data after validating durable TIFF outputs.
+
+    The committed macro currently writes multiresolution HDF5, while other
+    compatible BigStitcher configurations can use OME-Zarr or N5 directories.
+    Only the known pipeline-generated backing paths inside the channel job
+    directory are eligible. The dataset XML is deliberately retained as an
+    audit record, although it cannot reopen the deleted backing data.
+
+    If stitching or projection fails, this function is never reached. A
+    cleanup error is allowed to fail the task so a resume can retry it instead
+    of silently accumulating large intermediates.
+    """
+    if not enabled:
+        return []
+
+    fused = Path(fused)
+    projection = Path(projection)
+    channel_dir = fused.parent
+    if channel_dir.is_symlink() or not channel_dir.is_dir():
+        raise RuntimeError(
+            f"Refusing BigStitcher cleanup for unsafe channel directory: {channel_dir}"
+        )
+    channel_dir_resolved = channel_dir.resolve(strict=True)
+
+    fused_shape, fused_dtype = validate_tiff(fused)
+    if len(fused_shape) < 3:
+        raise ValueError(
+            f"Expected stitched ZYX TIFF before cleanup, got shape {fused_shape}: {fused}"
+        )
+    validate_tiff(projection, fused_shape[-2:], fused_dtype)
+
+    dataset_xml = channel_dir / "dataset.xml"
+    if (
+        dataset_xml.is_symlink()
+        or not dataset_xml.is_file()
+        or dataset_xml.stat().st_size <= 0
+    ):
+        raise RuntimeError(
+            "Refusing BigStitcher cleanup because dataset.xml is missing, empty, "
+            f"or a symlink: {dataset_xml}"
+        )
+
+    candidates = set(channel_dir.glob("dataset*.h5"))
+    candidates.update(
+        channel_dir / name
+        for name in ("dataset.ome.zarr", "dataset.zarr", "dataset.n5")
+        if (channel_dir / name).exists() or (channel_dir / name).is_symlink()
+    )
+
+    removed: list[Path] = []
+    for candidate in sorted(candidates, key=lambda path: path.name):
+        if candidate.parent.resolve(strict=True) != channel_dir_resolved:
+            raise RuntimeError(
+                f"Refusing to remove BigStitcher data outside {channel_dir}: {candidate}"
+            )
+        if candidate.is_symlink():
+            raise RuntimeError(
+                f"Refusing to remove symlinked BigStitcher data: {candidate}"
+            )
+        if candidate.is_dir():
+            if candidate.name not in {
+                "dataset.ome.zarr",
+                "dataset.zarr",
+                "dataset.n5",
+            }:
+                raise RuntimeError(
+                    f"Refusing to remove unexpected BigStitcher directory: {candidate}"
+                )
+            logging.info("Removing completed BigStitcher backing directory: %s", candidate)
+            shutil.rmtree(candidate)
+        elif candidate.is_file():
+            if not candidate.name.startswith("dataset") or candidate.suffix != ".h5":
+                raise RuntimeError(
+                    f"Refusing to remove unexpected BigStitcher file: {candidate}"
+                )
+            logging.info("Removing completed BigStitcher backing file: %s", candidate)
+            candidate.unlink()
+        else:
+            raise RuntimeError(
+                f"Refusing to remove unsupported BigStitcher path: {candidate}"
+            )
+        removed.append(candidate)
+
+    if removed:
+        logging.info(
+            "Removed %d completed BigStitcher backing path(s); retained %s, %s, and %s",
+            len(removed),
+            dataset_xml,
+            fused,
+            projection,
+        )
+    else:
+        logging.info(
+            "No BigStitcher backing data remain for %s (already cleaned or not created)",
+            fused.name,
+        )
+    return removed
+
+
 def clean_previous_results(root: Path, sample_name: str) -> None:
     """Remove all outputs from a previous run for this acquisition only.
 
@@ -643,6 +752,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--intensity-unmodified", type=float, default=0.5, help="BigStitcher unmodified-intensity regularization weight lambda2 (default: 0.5)")
     parser.add_argument("--overwrite", action="store_true", help="accepted for compatibility; outputs are cleaned by default on each run")
     parser.add_argument("--keep-previous", action="store_true", help="do not remove the previous pipeline result directory before rerunning")
+    cleanup_group = parser.add_mutually_exclusive_group()
+    cleanup_group.add_argument(
+        "--cleanup-stitching-intermediates",
+        dest="cleanup_stitching_intermediates",
+        action="store_true",
+        default=True,
+        help=(
+            "delete completed BigStitcher HDF5/Zarr/N5 backing data after the "
+            "fused TIFF and projection validate (default)"
+        ),
+    )
+    cleanup_group.add_argument(
+        "--keep-stitching-intermediates",
+        dest="cleanup_stitching_intermediates",
+        action="store_false",
+        help="retain BigStitcher backing data so its dataset.xml can be reopened",
+    )
     parser.add_argument("--keep-input-stacks", action="store_true", help="document intent; inputs are retained by default")
     parser.add_argument("--no-trim-zero-padding", action="store_true", help="keep padded all-zero TIFF borders (not recommended for these IMS files)")
     return parser
@@ -702,7 +828,13 @@ def main() -> int:
                 args.intensity_max_inliers, True,
                 args.intensity_offset_only, args.intensity_unmodified,
             )
-            max_project(fused, projections / f"{name}_{channel}_stitched_max_projection.tif", args.overwrite)
+            projection = projections / f"{name}_{channel}_stitched_max_projection.tif"
+            max_project(fused, projection, args.overwrite)
+            cleanup_stitching_intermediates(
+                fused,
+                projection,
+                enabled=args.cleanup_stitching_intermediates,
+            )
     logging.info("Finished. Results: %s", root)
     return 0
 
