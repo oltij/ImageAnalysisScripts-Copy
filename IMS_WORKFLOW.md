@@ -136,6 +136,13 @@ pipeline filename. Temporary TIFFs are removed after a failed write, and an
 abandoned temporary left by a forced job termination is removed automatically
 when that destination is attempted again.
 
+For mosaic input, BigStitcher's multiresolution backing data are deleted per
+channel by default only after the stable fused TIFF and maximum projection
+both validate. The current macro writes `dataset*.h5`; Zarr/N5 backing
+directories are also recognized. Failed channels retain their backing data.
+Use the low-level mosaic option `--keep-stitching-intermediates` when a
+reopenable `dataset.xml` is required.
+
 ## Preflight checks
 
 Before output creation, the controller verifies:
@@ -181,7 +188,11 @@ When wavelength metadata are available for every channel, the metadata report re
         └── run_manifest.json
 ```
 
-For already-stitched IMS input, the exported full Z stacks are retained under `01_exported/`. For mosaic input, all audit intermediates from the existing BaSiC/BigStitcher workflow are retained.
+For already-stitched IMS input, the exported full Z stacks are retained under
+`01_exported/`. For mosaic input, exported TIFFs, BaSiC-corrected TIFFs,
+stitched TIFFs, projections, BigStitcher XML, macro, and logs are retained.
+Only BigStitcher's large multiresolution backing data are removed after output
+validation by default.
 
 ## First-acquisition review
 

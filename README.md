@@ -727,6 +727,28 @@ bigstitcher.log
 The wrapper explicitly checks that intensity adjustment was reached and
 completed before fusion is accepted.
 
+BigStitcher's multiresolution backing data are temporary. The committed macro
+normally creates `dataset*.h5`; compatible runs may create
+`dataset.ome.zarr`, `dataset.zarr`, or `dataset.n5`. After both the fused 3-D
+TIFF and its maximum projection pass structural shape/dtype/pixel-payload
+validation, these backing paths are deleted by default for that channel. A
+failed stitch or projection never reaches cleanup, so its backing data remain
+available for diagnosis and resume. `dataset.xml`, `run_bigstitcher.ijm`,
+`bigstitcher.log`, the stable stitched TIFF, and the maximum projection are
+retained. Because the backing data are gone, the retained XML is provenance
+only and cannot reopen the BigStitcher dataset.
+
+To retain the complete reopenable BigStitcher dataset for a special run, pass:
+
+```bash
+--keep-stitching-intermediates
+```
+
+Cleanup is default-on in the IMS controller, IGF folder batch, and general raw
+IMS batch commands. Original `.ims` inputs, exported TIFFs, BaSiC-corrected
+TIFFs, stitched TIFFs, and maximum projections are never targets of this
+per-channel cleanup.
+
 #### `04_max_projections`
 
 Contains the final 2-D maximum-intensity projection for each channel:
