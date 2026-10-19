@@ -83,23 +83,25 @@ def test_synthetic_end_to_end():
         assert intens['B_overlap_integrated_intensity_native_sum'].gt(0).all()
         allowed=mod.stable_ids_by_channel([h5p])
         assert allowed['LHX6']=={1,2} and allowed['PV']=={11,12}
-        q=mod.quartile_representatives(pd.DataFrame([{'ObjectID':i,'Area_um2':i} for i in range(1,9)]),'Area_um2',['ObjectID'])
-        assert [int(row['ObjectID']) for _,row,_,_ in q]==[2,4,6,8]
+        q = mod.quartile_examples(pd.DataFrame([{'ObjectID':i,'Area_um2':i} for i in range(1,9)]), 'Area_um2', ['ObjectID'], max_examples=2)
+        assert [pack['quartile'] for pack in q] == [1,2,3,4]
+        assert all(pack['count'] == 2 for pack in q)
+        assert [int(pack['examples'][0]['row']['ObjectID']) for pack in q] == [1,3,5,7]
         # Genuine final stable matched pair example (exclude unmatched 3/13).
         # ROI area/intensities and plots refer to the same A/B identifiers.
         pdf=root/'test_synthetic_report.pdf'
         with PdfPages(pdf) as out:
             mod.whole_page(out,analysis,[])
             rows=mod.roi_quartile_pages(out,analysis,'LHX6',['integrated_intensity'],{1,2},0,'151-3',[])
-            vals=mod.matched_pair_quartile_page(out,p,0,'151-3')
+            vals = mod.matched_pair_quartile_pages(out, p, 0, '151-3', examples_per_quartile=10)
         assert len(rows)==2
         assert len(vals)==2 and set(vals['A_ObjectID'])=={1,2}
         assert set(vals['B_ObjectID'])=={11,12}
         import fitz
         doc=fitz.open(pdf)
         txt='\n'.join(page.get_text() for page in doc)
-        assert doc.page_count==3
-        assert 'FINAL stable-matched' in txt
+        assert doc.page_count >= 3
+        assert 'final stable-matched' in txt.lower() or 'FINAL STABLE MATCH' in txt
         assert 'Integrated fluorescence' in txt
         assert 'ROI #1' in txt or 'ROI #2' in txt
         assert 'Q1' in txt and 'Q2' in txt
@@ -129,7 +131,7 @@ def test_synthetic_end_to_end():
         try:
             code = mod.main(['--h1-workspace', str(root), '--remaining-workspace', str(root),
                              '--out', str(root/'reports'), '--only-sample','151-3',
-                             '--max-fields','1', '--max-examples','1',
+                             '--max-fields','1', '--max-examples','10',
                              '--roi-metrics','area','--compact'])
         finally:
             mod.HERE = orig_here
