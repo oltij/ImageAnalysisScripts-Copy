@@ -217,23 +217,34 @@ def resolve_roi_files(analysis: Path, channel: str) -> tuple[Path, Path] | None:
     return None
 
 
-def quartile_representatives(frame: pd.DataFrame, metric: str, id_columns: list[str]) -> list[tuple[int, pd.Series | None, int, tuple[float, float] | None]]:
-    """Select the median-ranked REAL item in each equal-count quartile.
+def quartile_examples(frame: pd.DataFrame, metric: str, id_columns: list[str],
+                      max_examples: int = 10) -> list[dict]:
+    """Return up to max_examples real records from each equal-count quartile.
 
-    Quartiles are ranked within eligible objects, not absolute 0-25% overlap bins.
-    The original IDs break measurement ties deterministically. No duplicates.
+    Records are ranked within eligible objects, not absolute 0-25% bins. Within a
+    quartile, examples are chosen at approximately even rank intervals so the
+    displayed set spans that quartile instead of repeating near-identical medians.
     """
     work = frame.copy()
     work[metric] = pd.to_numeric(work[metric], errors="coerce")
     work = work[np.isfinite(work[metric])].sort_values([metric] + id_columns, kind="mergesort").reset_index(drop=True)
     chunks = np.array_split(np.arange(len(work)), 4)
-    out = []
+    out: list[dict] = []
     for q, inds in enumerate(chunks, 1):
         if not len(inds):
-            out.append((q, None, 0, None))
+            out.append({"quartile": q, "count": 0, "range": None, "examples": []})
             continue
-        chosen = work.iloc[int(inds[len(inds)//2])].copy()
-        out.append((q, chosen, len(inds), (float(work.iloc[inds[0]][metric]), float(work.iloc[inds[-1]][metric]))))
+        span = (float(work.iloc[inds[0]][metric]), float(work.iloc[inds[-1]][metric]))
+        if len(inds) <= max_examples:
+            chosen_positions = list(range(len(inds)))
+        else:
+            chosen_positions = sorted(set(int(x) for x in np.linspace(0, len(inds)-1, num=max_examples)))
+        examples = []
+        for pos in chosen_positions:
+            idx = int(inds[pos])
+            row = work.iloc[idx].copy()
+            examples.append({"row": row, "rank_in_quartile": pos + 1, "quartile_size": len(inds)})
+        out.append({"quartile": q, "count": len(inds), "range": span, "examples": examples})
     return out
 
 
@@ -269,87 +280,107 @@ def roi_crop_rgba(image: np.ndarray, xy: np.ndarray, limits: tuple[float,float],
 
 def roi_quartile_pages(pdf: PdfPages, analysis: Path, channel: str, metric_keys: list[str],
                        allowed_ids: set[int], field_index: int, sample: str,
-                       provenance: list[str]) -> list[dict]:
-    """Each selected final-stable-matched ROI gets ONE field locator, crop and
-    metric values within the same horizontal row (Q1..Q4)."""
+                       provenance: list[str], *, examples_per_quartile: int = 10,
+                       rows_per_page: int = 5) -> list[dict]:
+    """Display up to N exemplar ROIs per quartile, with each row fully traceable.
+
+    Every displayed row contains exactly one ROI's locator image, crop, and
+    quantitative values side-by-side. Pages are split by metric and quartile, with
+    multiple pages when needed for readability.
+    """
     files = resolve_roi_files(analysis, channel)
     img = fluorescence_image(analysis, channel)
     if files is None or img is None:
         LOGGER.warning("No final ROI metric/pixel files or fluorescence for %s", channel)
         return []
     image, image_source = img
-    pixels = pd.read_csv(files[0], usecols=lambda c: c in {"ROI","ObjectID","CellID","X","Y"})
-    groups = to_pairs(pixels,channel)
+    pixels = pd.read_csv(files[0], usecols=lambda c: c in {"ROI", "ObjectID", "CellID", "X", "Y"})
+    groups = to_pairs(pixels, channel)
     metrics = pd.read_csv(files[1])
     if "ObjectID" not in metrics:
         raise ValueError(f"{files[1]}: missing ObjectID")
     if metrics["ObjectID"].duplicated().any():
         raise ValueError(f"{files[1]}: duplicate ROI ObjectID")
-    check_pixels(groups,image.shape,channel)
+    check_pixels(groups, image.shape, channel)
     eligible = (set(groups) & set(metrics["ObjectID"].astype(int)) & allowed_ids)
     if not eligible:
-        LOGGER.warning("No final-stable-matched %s ROI IDs also present in final metric/pixel tables",channel)
+        LOGGER.warning("No final-stable-matched %s ROI IDs also present in final metric/pixel tables", channel)
         return []
     d = metrics[metrics["ObjectID"].isin(eligible)].copy()
-    provenance.extend([f"{channel} final ROI pixels: {files[0]}",f"{channel} final ROI metrics: {files[1]}",f"{channel} image: {image_source}"])
-    limits=image_limits(image)
-    skip=max(1,math.ceil(max(image.shape)/590))
-    thumb=gray_with_limits(image[::skip,::skip],limits)
+    provenance.extend([f"{channel} final ROI pixels: {files[0]}", f"{channel} final ROI metrics: {files[1]}", f"{channel} image: {image_source}"])
+    limits = image_limits(image)
+    skip = max(1, math.ceil(max(image.shape) / 590))
+    thumb = gray_with_limits(image[::skip, ::skip], limits)
     mask, _ = get_reference_mask(analysis, image.shape)
     if mask is not None:
-        orgedge=edge(mask)[::skip,::skip]
-        thumb_rgb=np.repeat(thumb[:,:,None],3,axis=2)
-        thumb_rgb[orgedge] = (.05,.05,.05)
+        orgedge = edge(mask)[::skip, ::skip]
+        thumb_rgb = np.repeat(thumb[:, :, None], 3, axis=2)
+        thumb_rgb[orgedge] = (.05, .05, .05)
     else:
-        thumb_rgb=np.repeat(thumb[:,:,None],3,axis=2)
-    output=[]
+        thumb_rgb = np.repeat(thumb[:, :, None], 3, axis=2)
+    output = []
     for key in metric_keys:
         col, display_name = ROI_METRICS[key]
         if col not in d:
-            LOGGER.warning("%s: missing metric %s (omitting this quartile sheet)",channel,col)
+            LOGGER.warning("%s: missing metric %s (omitting this quartile sheet)", channel, col)
             continue
-        picks=quartile_representatives(d,col,["ObjectID"])
-        fig=plt.figure(figsize=(16.4,11.8),facecolor='white')
-        gs=fig.add_gridspec(4,3,left=.055,right=.96,top=.89,bottom=.08,wspace=.18,hspace=.45,
-                            width_ratios=[1.18,1.34,2.2])
-        for q, chosen, count, span in picks:
-            axloc=fig.add_subplot(gs[q-1,0]); axcrop=fig.add_subplot(gs[q-1,1]); axinfo=fig.add_subplot(gs[q-1,2])
-            for ax in (axloc,axcrop,axinfo):ax.axis('off')
-            if chosen is None:
-                axinfo.text(.02,.55,f'Q{q}: no eligible ROI',fontsize=12,va='center',weight='bold')
+        quartiles = quartile_examples(d, col, ["ObjectID"], max_examples=examples_per_quartile)
+        for qpack in quartiles:
+            q = qpack["quartile"]
+            qcount = qpack["count"]
+            qrange = qpack["range"]
+            examples = qpack["examples"]
+            if not examples:
+                fig = plt.figure(figsize=(16.6, 4.6), facecolor='white')
+                fig.text(.055, .85, f'{channel} · {display_name} · Q{q}', fontsize=17, weight='bold')
+                fig.text(.055, .62, f'No eligible final-stable-matched ROI present in Q{q}.', fontsize=13)
+                fig.text(.055, .18, 'Quartiles are equal-count rank groups among final stable-matched ROI IDs only.', fontsize=9)
+                pdf.savefig(fig, bbox_inches='tight'); plt.close(fig)
                 continue
-            oid=int(chosen['ObjectID']); xy=groups[oid]
-            x,y=float(xy[:,0].mean()),float(xy[:,1].mean())
-            axloc.imshow(thumb_rgb,interpolation='nearest'); axloc.scatter([x/skip],[y/skip],s=140,
-                marker='o',facecolors='none',edgecolors='#00bfff',linewidths=2.1)
-            axloc.set_title(f'Q{q} · tissue position',fontsize=9)
-            axcrop.imshow(roi_crop_rgba(image,xy,limits),interpolation='nearest')
-            axcrop.set_title(f'{channel} ROI {oid} · real fluorescence',fontsize=9)
-            native=image[xy[:,1],xy[:,0]].astype(np.float64)
-            values={"Area (µm²)": chosen.get('Area_um2',float('nan')),
-                    "Mean intensity (native)":float(native.mean()),
-                    "Integrated intensity (native sum)":float(native.sum()),
-                    "Circularity": chosen.get('Circularity',float('nan')),
-                    "Solidity": chosen.get('Solidity',float('nan')),
-                    "Eccentricity": chosen.get('Eccentricity',float('nan'))}
-            lines=[f'Q{q}  |  {channel} ROI #{oid}  |  rank value: {float(chosen[col]):.5g}',
-                   f'Quartile eligible n = {count}  |  observed range {span[0]:.5g}–{span[1]:.5g}',
-                   f'Area: {float(values["Area (µm²)"]):.5g} µm²     Mean fluorescence: {values["Mean intensity (native)"]:.5g}',
-                   f'Integrated fluorescence: {values["Integrated intensity (native sum)"]:.6g} (raw pixel sum)',
-                   f'Circularity: {float(values["Circularity"]):.4g}   Solidity: {float(values["Solidity"]):.4g}   Eccentricity: {float(values["Eccentricity"]):.4g}']
-            axinfo.text(.01,.99,lines[0],weight='bold',fontsize=10.6,va='top')
-            axinfo.text(.01,.82,'\n'.join(lines[1:]),fontsize=9.7,va='top',linespacing=1.55)
-            output.append({"field_index":field_index,"sample":sample,"channel":channel,"quartile":f'Q{q}',
-                "rank_metric":col,"rank_value":float(chosen[col]),"quartile_n":count,
-                "quartile_range_min":span[0],"quartile_range_max":span[1],"ROI_ObjectID":oid,
-                "roi_pixel_count":len(xy),"Area_um2":values["Area (µm²)"],
-                "mean_native_intensity":values["Mean intensity (native)"],
-                "integrated_native_intensity_sum":values["Integrated intensity (native sum)"],
-                "Circularity":values["Circularity"],"Solidity":values["Solidity"],"Eccentricity":values["Eccentricity"]})
-        fig.text(.055,.963,f'{channel} · {display_name} · four final-matched ROI quartiles',fontsize=17,weight='bold')
-        fig.text(.055,.925,f'Sample {sample}  |  Field {field_index}  |  {len(eligible)} ROI IDs present in final stable matches',fontsize=10.5)
-        fig.text(.055,.027,'Left: whole-organoid locator (cyan circle). Middle: crop from aligned fluorescence, cyan ROI border. Right: values for THAT SAME ROI ID only. Q1–Q4 = equal-count rank quartiles of eligible ROIs, not % tissue area. Native intensities are uncorrected.',fontsize=8.7)
-        pdf.savefig(fig,bbox_inches='tight');plt.close(fig)
+            for page_start in range(0, len(examples), rows_per_page):
+                page_examples = examples[page_start:page_start + rows_per_page]
+                page_no = page_start // rows_per_page + 1
+                page_total = math.ceil(len(examples) / rows_per_page)
+                fig = plt.figure(figsize=(18.2, 2.35 * len(page_examples) + 1.9), facecolor='white')
+                gs = fig.add_gridspec(len(page_examples), 3, left=.045, right=.97, top=.86, bottom=.08, wspace=.16, hspace=.38, width_ratios=[1.08, 1.18, 2.55])
+                for ridx, example in enumerate(page_examples):
+                    axloc = fig.add_subplot(gs[ridx, 0]); axcrop = fig.add_subplot(gs[ridx, 1]); axinfo = fig.add_subplot(gs[ridx, 2])
+                    for ax in (axloc, axcrop, axinfo):
+                        ax.axis('off')
+                    chosen = example['row']
+                    oid = int(chosen['ObjectID']); xy = groups[oid]
+                    x, y = float(xy[:, 0].mean()), float(xy[:, 1].mean())
+                    axloc.imshow(thumb_rgb, interpolation='nearest'); axloc.scatter([x/skip], [y/skip], s=120, marker='o', facecolors='none', edgecolors='#00bfff', linewidths=2.0)
+                    axloc.set_title(f'Field locator', fontsize=9)
+                    axcrop.imshow(roi_crop_rgba(image, xy, limits), interpolation='nearest')
+                    axcrop.set_title(f'{channel} ROI {oid} · fluorescence', fontsize=9)
+                    native = image[xy[:, 1], xy[:, 0]].astype(np.float64)
+                    values = {"Area (µm²)": chosen.get('Area_um2', float('nan')),
+                              "Mean intensity (native)": float(native.mean()),
+                              "Integrated intensity (native sum)": float(native.sum()),
+                              "Circularity": chosen.get('Circularity', float('nan')),
+                              "Solidity": chosen.get('Solidity', float('nan')),
+                              "Eccentricity": chosen.get('Eccentricity', float('nan'))}
+                    lines = [
+                        f'Q{q} · ROI #{oid} · example {page_start + ridx + 1} of {len(examples)} displayed ({example["quartile_size"]} total in quartile)',
+                        f'Rank metric: {display_name} = {float(chosen[col]):.5g}    Quartile range: {qrange[0]:.5g}–{qrange[1]:.5g}',
+                        f'Area: {float(values["Area (µm²)"]):.5g} µm²    Mean fluorescence: {values["Mean intensity (native)"]:.5g}    Integrated fluorescence Σ: {values["Integrated intensity (native sum)"]:.6g}',
+                        f'Circularity: {float(values["Circularity"]):.4g}    Solidity: {float(values["Solidity"]):.4g}    Eccentricity: {float(values["Eccentricity"]):.4g}',
+                    ]
+                    axinfo.text(.01, .99, lines[0], weight='bold', fontsize=10.4, va='top')
+                    axinfo.text(.01, .76, "\n".join(lines[1:]), fontsize=9.5, va='top', linespacing=1.5)
+                    output.append({"field_index": field_index, "sample": sample, "channel": channel, "quartile": f'Q{q}',
+                                   "rank_metric": col, "rank_value": float(chosen[col]), "quartile_n": qcount,
+                                   "quartile_range_min": qrange[0], "quartile_range_max": qrange[1], "ROI_ObjectID": oid,
+                                   "display_order_within_quartile": page_start + ridx + 1, "displayed_examples_in_quartile": len(examples),
+                                   "roi_pixel_count": len(xy), "Area_um2": values["Area (µm²)"],
+                                   "mean_native_intensity": values["Mean intensity (native)"],
+                                   "integrated_native_intensity_sum": values["Integrated intensity (native sum)"],
+                                   "Circularity": values["Circularity"], "Solidity": values["Solidity"], "Eccentricity": values["Eccentricity"]})
+                fig.text(.045, .965, f'{channel} · {display_name} · Q{q} final-matched ROI exemplars', fontsize=16.5, weight='bold')
+                fig.text(.045, .928, f'Sample {sample} | Field {field_index} | {len(eligible)} ROI IDs eligible through final stable matches | displaying {len(page_examples)} of {len(examples)} requested exemplars (page {page_no}/{page_total})', fontsize=10.2)
+                fig.text(.045, .03, 'Each row is one ROI only: left = whole-field location, middle = the fluorescence crop for that same ROI ID, right = values for that same ROI ID. Cyan circle/outline marks the displayed ROI. Quartiles are equal-count rank groups, not 0–25% absolute bins.', fontsize=8.8)
+                pdf.savefig(fig, bbox_inches='tight'); plt.close(fig)
     return output
 
 
@@ -426,72 +457,83 @@ def intensity_rows(pair: PairData, field_index: int, sample: str, selected_match
     return pd.DataFrame(records)
 
 
-def matched_pair_quartile_page(pdf: PdfPages, pair: PairData, field_index: int, sample: str) -> pd.DataFrame:
-    """Display exactly one final stable-matched PAIR per overlap rank quartile.
+def matched_pair_quartile_pages(pdf: PdfPages, pair: PairData, field_index: int, sample: str, *,
+                              examples_per_quartile: int = 10, rows_per_page: int = 5) -> pd.DataFrame:
+    """Display up to N final stable-matched pairs per overlap-rank quartile.
 
-    Q1..Q4 mean rank-quartiles among only the final matched pairs; each card
-    has B image, A image, composite and exact A/B IDs + raw values. This is
-    NOT the old 0-25,25-50,50-75,75-100 absolute-overlap classification.
+    Each displayed row contains the B image, A image, composite, and exact
+    measurements for those same A/B ROI IDs. Only final stable matches are used.
     """
     if pair.matching.empty:
-        LOGGER.info("%s has zero final stable matches; omit quartile image page",pair.name)
+        LOGGER.info("%s has zero final stable matches; omit quartile image page", pair.name)
         return pd.DataFrame()
-    # The overlap table is the canonical source of directional overlap values.
-    merged=pair.matching[["A_ObjectID","B_ObjectID"]].merge(
-        pair.overlaps[["A_ObjectID","B_ObjectID","A_Percent_Inside_B","B_Percent_Inside_A"]],
-        on=["A_ObjectID","B_ObjectID"],how='left',validate='one_to_one')
+    merged = pair.matching[["A_ObjectID", "B_ObjectID"]].merge(
+        pair.overlaps[["A_ObjectID", "B_ObjectID", "A_Percent_Inside_B", "B_Percent_Inside_A"]],
+        on=["A_ObjectID", "B_ObjectID"], how='left', validate='one_to_one')
     if merged['A_Percent_Inside_B'].isna().any() or merged['B_Percent_Inside_A'].isna().any():
         raise ValueError(f'{pair.source}: final matches missing overlap metrics')
-    picks=quartile_representatives(merged,'A_Percent_Inside_B',["A_ObjectID","B_ObjectID"])
-    selected_rows=[]
-    for q,row,count,span in picks:
-        if row is None:continue
-        record=row.to_dict();record.update(quartile=f'Q{q}',quartile_n=count,
-                                           quartile_range_min=span[0],quartile_range_max=span[1])
-        selected_rows.append(record)
-    selected=pd.DataFrame(selected_rows)
-    measured=intensity_rows(pair,field_index,sample,selected_matches=selected)
-    if len(measured)!=len(selected):raise ValueError('Selected matched pair intensity count mismatch')
-    measured=measured.merge(selected,on=['A_ObjectID','B_ObjectID'],how='left',validate='one_to_one',suffixes=('','_selected'))
-    bounds_a=image_limits(pair.img_a);bounds_b=image_limits(pair.img_b)
-    fig=plt.figure(figsize=(17,12.4),facecolor='white')
-    gs=fig.add_gridspec(4,4,left=.05,right=.97,top=.875,bottom=.10,wspace=.14,hspace=.43,
-                       width_ratios=[1.13,1.13,1.13,2.8])
-    for q in range(1,5):
-        ax_b=fig.add_subplot(gs[q-1,0]);ax_a=fig.add_subplot(gs[q-1,1]);ax_c=fig.add_subplot(gs[q-1,2]);ax_t=fig.add_subplot(gs[q-1,3]);
-        for ax in (ax_b,ax_a,ax_c,ax_t):ax.axis('off')
-        rows=measured[measured['quartile']==f'Q{q}']
+    quartiles = quartile_examples(merged, 'A_Percent_Inside_B', ["A_ObjectID", "B_ObjectID"], max_examples=examples_per_quartile)
+    selected_rows = []
+    for qpack in quartiles:
+        q = qpack['quartile']
+        for pos, ex in enumerate(qpack['examples'], start=1):
+            row = ex['row'].to_dict()
+            row.update(quartile=f'Q{q}', quartile_n=qpack['count'], quartile_range_min=qpack['range'][0], quartile_range_max=qpack['range'][1],
+                       display_order_within_quartile=pos, displayed_examples_in_quartile=len(qpack['examples']))
+            selected_rows.append(row)
+    selected = pd.DataFrame(selected_rows)
+    if selected.empty:
+        return pd.DataFrame()
+    measured = intensity_rows(pair, field_index, sample, selected_matches=selected)
+    if len(measured) != len(selected):
+        raise ValueError('Selected matched pair intensity count mismatch')
+    measured = measured.merge(selected, on=['A_ObjectID', 'B_ObjectID'], how='left', validate='one_to_one', suffixes=('', '_selected'))
+    bounds_a = image_limits(pair.img_a); bounds_b = image_limits(pair.img_b)
+    for q in range(1, 5):
+        rows = measured[measured['quartile'] == f'Q{q}'].reset_index(drop=True)
         if rows.empty:
-            ax_t.text(.03,.5,f'Q{q}: no final matched pairs in this rank quartile',fontsize=11,weight='bold',va='center')
+            fig = plt.figure(figsize=(16.8, 4.4), facecolor='white')
+            fig.text(.05, .83, f'{pair.name} · Q{q} final stable-matched exemplars', fontsize=16.5, weight='bold')
+            fig.text(.05, .60, f'No final stable-matched pairs are present in Q{q}.', fontsize=12.5)
+            fig.text(.05, .18, f'Pair source: {pair.source}', fontsize=9)
+            pdf.savefig(fig, bbox_inches='tight'); plt.close(fig)
             continue
-        r=rows.iloc[0];aid=int(r['A_ObjectID']);bid=int(r['B_ObjectID'])
-        ap=pair.a_pixels[aid]; bp=pair.b_pixels[bid]; coords=np.vstack((ap,bp))
-        x0,x1,y0,y1=img_crop(pair.img_a,coords,padding=22)
-        ca=gray_with_limits(pair.img_a[y0:y1,x0:x1],bounds_a)
-        cb=gray_with_limits(pair.img_b[y0:y1,x0:x1],bounds_b)
-        am=np.zeros(ca.shape,bool);bm=np.zeros(cb.shape,bool)
-        am[ap[:,1]-y0,ap[:,0]-x0]=True;bm[bp[:,1]-y0,bp[:,0]-x0]=True
-        ra=np.repeat(ca[:,:,None],3,axis=2);rb=np.repeat(cb[:,:,None],3,axis=2)
-        ra[edge(am)]=(.98,.15,.16);rb[edge(bm)]=(.14,.44,1.)
-        composite=np.stack([ca,cb,np.zeros_like(ca)],axis=-1)
-        composite[edge(am)]=(.98,.15,.16);composite[edge(bm)]=(.13,.35,1.)
-        for ax,img,title in ((ax_b,rb,f'{pair.b} ROI #{bid}'),(ax_a,ra,f'{pair.a} ROI #{aid}'),(ax_c,composite,'A red · B green')):
-            ax.imshow(img,interpolation='nearest');ax.set_title(title,fontsize=9.3,pad=3)
-        lines=[f'Q{q} · FINAL STABLE MATCH · {pair.a} #{aid}  ↔  {pair.b} #{bid}',
-               f'{pair.a} in {pair.b}: {float(r["A_percent_inside_B"]):.2f}%     {pair.b} in {pair.a}: {float(r["B_percent_inside_A"]):.2f}%',
-               f'Q{q} n={int(r["quartile_n"])}; overlap range {float(r["quartile_range_min"]):.2f}–{float(r["quartile_range_max"]):.2f}%',
-               f'{pair.a} ROI pixels: {int(r["A_roi_area_pixels"])}     {pair.b} ROI pixels: {int(r["B_roi_area_pixels"])}',
-               f'{pair.a} whole ROI:  mean {float(r["A_roi_mean_intensity_native"]):.5g}; Σ {float(r["A_roi_integrated_intensity_native_sum"]):.6g}',
-               f'{pair.b} whole ROI:  mean {float(r["B_roi_mean_intensity_native"]):.5g}; Σ {float(r["B_roi_integrated_intensity_native_sum"]):.6g}',
-               f'Overlap pixels: {int(r["overlap_area_pixels"])}',
-               f'Overlap Σ: {pair.a}={float(r["A_overlap_integrated_intensity_native_sum"]):.5g}; {pair.b}={float(r["B_overlap_integrated_intensity_native_sum"]):.5g}']
-        ax_t.text(.01,.99,lines[0],weight='bold',fontsize=10,va='top')
-        ax_t.text(.01,.84,'\n'.join(lines[1:]),fontsize=9.0,va='top',linespacing=1.38)
-    fig.text(.05,.969,f'{pair.name} · FINAL stable-matched colocalization',fontsize=17,weight='bold')
-    fig.text(.05,.924,f'Sample {sample}  |  Field {field_index}  |  Matched pairs: {len(pair.matching)}  |  A-proposing threshold: {pair.threshold:g}%',fontsize=10.5)
-    fig.text(.05,.913,f'Quartiles rank final matches by percent of {pair.a} ROI area inside {pair.b}. ONE representative final matched pair per quartile.',fontsize=9)
-    fig.text(.05,.046,'Rows = independent displayed pairs. All measurements beside each row refer ONLY to the A/B ROI IDs in THAT row. B blue outline, A red outline; composite: A fluorescence red, B fluorescence green. Σ = sum of unmodified native fluorescence pixel values; no background, gain or anti-GFP normalization.',fontsize=8.9)
-    pdf.savefig(fig,bbox_inches='tight');plt.close(fig)
+        for page_start in range(0, len(rows), rows_per_page):
+            chunk = rows.iloc[page_start:page_start + rows_per_page].copy()
+            page_no = page_start // rows_per_page + 1
+            page_total = math.ceil(len(rows) / rows_per_page)
+            fig = plt.figure(figsize=(18.2, 2.45 * len(chunk) + 2.0), facecolor='white')
+            gs = fig.add_gridspec(len(chunk), 4, left=.042, right=.975, top=.86, bottom=.08, wspace=.12, hspace=.34, width_ratios=[1.04, 1.04, 1.04, 2.9])
+            for ridx, r in enumerate(chunk.itertuples(index=False)):
+                ax_b = fig.add_subplot(gs[ridx, 0]); ax_a = fig.add_subplot(gs[ridx, 1]); ax_c = fig.add_subplot(gs[ridx, 2]); ax_t = fig.add_subplot(gs[ridx, 3])
+                for ax in (ax_b, ax_a, ax_c, ax_t): ax.axis('off')
+                aid = int(r.A_ObjectID); bid = int(r.B_ObjectID)
+                ap = pair.a_pixels[aid]; bp = pair.b_pixels[bid]; coords = np.vstack((ap, bp))
+                x0, x1, y0, y1 = img_crop(pair.img_a, coords, padding=22)
+                ca = gray_with_limits(pair.img_a[y0:y1, x0:x1], bounds_a)
+                cb = gray_with_limits(pair.img_b[y0:y1, x0:x1], bounds_b)
+                am = np.zeros(ca.shape, bool); bm = np.zeros(cb.shape, bool)
+                am[ap[:, 1]-y0, ap[:, 0]-x0] = True; bm[bp[:, 1]-y0, bp[:, 0]-x0] = True
+                ra = np.repeat(ca[:, :, None], 3, axis=2); rb = np.repeat(cb[:, :, None], 3, axis=2)
+                ra[edge(am)] = (.98, .15, .16); rb[edge(bm)] = (.14, .44, 1.)
+                composite = np.stack([ca, cb, np.zeros_like(ca)], axis=-1)
+                composite[edge(am)] = (.98, .15, .16); composite[edge(bm)] = (.13, .35, 1.)
+                for ax, img, title in ((ax_b, rb, f'{pair.b} ROI #{bid}'), (ax_a, ra, f'{pair.a} ROI #{aid}'), (ax_c, composite, 'A red · B green')):
+                    ax.imshow(img, interpolation='nearest'); ax.set_title(title, fontsize=8.8, pad=3)
+                lines = [
+                    f'Q{q} · pair {page_start + ridx + 1} of {len(rows)} displayed · FINAL STABLE MATCH',
+                    f'{pair.a} #{aid} ↔ {pair.b} #{bid}    {pair.a} in {pair.b}: {float(r.A_percent_inside_B):.2f}%    {pair.b} in {pair.a}: {float(r.B_percent_inside_A):.2f}%',
+                    f'Quartile size: {int(r.quartile_n)}    overlap range in Q{q}: {float(r.quartile_range_min):.2f}–{float(r.quartile_range_max):.2f}%',
+                    f'{pair.a}: ROI pixels {int(r.A_roi_area_pixels)}    mean {float(r.A_roi_mean_intensity_native):.5g}    Σ {float(r.A_roi_integrated_intensity_native_sum):.6g}',
+                    f'{pair.b}: ROI pixels {int(r.B_roi_area_pixels)}    mean {float(r.B_roi_mean_intensity_native):.5g}    Σ {float(r.B_roi_integrated_intensity_native_sum):.6g}',
+                    f'Overlap pixels: {int(r.overlap_area_pixels)}    overlap Σ: {pair.a}={float(r.A_overlap_integrated_intensity_native_sum):.5g}    {pair.b}={float(r.B_overlap_integrated_intensity_native_sum):.5g}',
+                ]
+                ax_t.text(.01, .99, lines[0], weight='bold', fontsize=10, va='top')
+                ax_t.text(.01, .80, "\n".join(lines[1:]), fontsize=9.2, va='top', linespacing=1.4)
+            fig.text(.042, .965, f'{pair.name} · Q{q} final stable-matched exemplars', fontsize=16.2, weight='bold')
+            fig.text(.042, .928, f'Sample {sample} | Field {field_index} | Matched pairs: {len(pair.matching)} | A-proposing threshold: {pair.threshold:g}% | displaying {len(chunk)} of {len(rows)} requested exemplars (page {page_no}/{page_total})', fontsize=10)
+            fig.text(.042, .03, 'Each row is one exact final matched pair only: left = B fluorescence, center-left = A fluorescence, center-right = composite, right = values for these same A/B ROI IDs. Blue outline = B ROI; red outline = A ROI. Intensities are native uncorrected fluorescence.', fontsize=8.6)
+            pdf.savefig(fig, bbox_inches='tight'); plt.close(fig)
     return measured
 
 
@@ -581,8 +623,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument('--max-fields',type=int,help='Only this many sorted eligible fields (for testing)')
     ap.add_argument('--roi-metrics',default='integrated_intensity',
                     help='Ranking metric(s) for standalone matched-ROI quartile sheets. Choose: '+','.join(ROI_METRICS))
-    ap.add_argument('--max-examples',type=int,default=1,
-                    help='Compatibility parameter; one representative per quartile is always displayed')
+    ap.add_argument('--max-examples',type=int,default=10,
+                    help='Number of displayed exemplar ROIs or matched pairs per quartile (default: 10).')
     ap.add_argument('--skip-single-rois',action='store_true')
     ap.add_argument('--skip-colocalization',action='store_true')
     ap.add_argument('--skip-summary-plots',action='store_true')
@@ -593,8 +635,8 @@ def main(argv: list[str] | None = None) -> int:
     args=ap.parse_args(argv)
     if args.append_existing_qc_pdfs:ap.error('Appending legacy QC PDFs is deliberately disabled: they include non-stable matched examples and very large appendices')
     if args.max_fields is not None and args.max_fields<1:ap.error('--max-fields must be positive')
-    if args.max_examples<1 or args.max_examples>10:ap.error('--max-examples must be 1..10')
-    if args.max_examples!=1:LOGGER.warning('Only ONE representative per quartile is displayed (ignoring --max-examples=%d)',args.max_examples)
+    if args.max_examples < 1 or args.max_examples > 25:
+        ap.error('--max-examples must be 1..25')
     keys=[k.strip() for k in args.roi_metrics.split(',') if k.strip()]
     if not keys or len(set(keys))!=len(keys) or any(k not in ROI_METRICS for k in keys):
         ap.error('Invalid --roi-metrics; allowed: '+','.join(ROI_METRICS))
@@ -636,22 +678,23 @@ def main(argv: list[str] | None = None) -> int:
                     f'{entry["cell_line"]} | {entry["condition"]} | {entry["anti_gfp_status"]} | Ventral organoid',
                     'This PDF represents ONE microscope field, not all fields in its sample-section.',
                     'Final stable matches ONLY: standalone ROI examples must participate in at least one final upstream stable match. Colocalization examples are final one-to-one matched pairs only. No unmatched or below-threshold displays.',
-                    'A row of images, IDs and numeric measurements always refers to exactly the SAME selected ROI or A/B PAIR. Each rank quartile Q1–Q4 has one deterministic median-ranked representative (if available).',
+                    'A row of images, IDs and numeric measurements always refers to exactly the SAME selected ROI or A/B PAIR. Each rank quartile Q1–Q4 displays up to the requested number of real exemplars, chosen to span that quartile.',
                     'Native integrated intensity is the sum of ORIGINAL fluorescence pixel values in that exact ROI; measurements are not background or antibody normalized.',
                     'Comparison plots circle this exact field in black. Other dots remain visible. Fields from the same block are not independent biological replicates.',
                     'Final stable-matched IDs eligible for single-channel quartiles: '+', '.join(f'{ch}={len(stable.get(ch,set()))}' for ch in ('GFP','LHX6','PV'))+'. A channel with no eligible final matches is omitted, never populated with unmatched objects.',
-                    f'Available colocalization analysis files: {len(files)}. Each pair with final matches contributes at most one four-row quartile sheet.'
+                    f'Display policy: up to {args.max_examples} exemplar ROIs or stable-matched pairs per quartile, with multiple pages when needed for readability.',
+                    f'Available colocalization analysis files: {len(files)}. Each pair with final matches contributes quartile pages, split automatically when needed.'
                 ])
                 whole_page(pdf,analysis,provenance)
                 if not args.skip_single_rois:
                     for channel in ('GFP','LHX6','PV'):
-                        single_rows.extend(roi_quartile_pages(pdf,analysis,channel,keys,stable.get(channel,set()),int(entry['index']),entry['sample'],provenance))
+                        single_rows.extend(roi_quartile_pages(pdf, analysis, channel, keys, stable.get(channel, set()), int(entry['index']), entry['sample'], provenance, examples_per_quartile=args.max_examples))
                 if not args.skip_colocalization:
                     for pairfile in files:
                         pair=load_pair(pairfile)
                         provenance.append('Pair HDF5: '+str(pair.source))
                         if not pair.matching.empty:
-                            records=matched_pair_quartile_page(pdf,pair,int(entry['index']),entry['sample'])
+                            records = matched_pair_quartile_pages(pdf, pair, int(entry['index']), entry['sample'], examples_per_quartile=args.max_examples)
                             if not records.empty:matched_rows.append(records)
                         del pair
                 if not args.skip_summary_plots:
@@ -666,10 +709,10 @@ def main(argv: list[str] | None = None) -> int:
                             one_metric_page(pdf,data,plotmod,metric,title,unit,int(entry['index']),gfp=True)
                 note_page(pdf,'Measurement key, traceability and source files',[
                     'Q1–Q4 are equal-count quartiles ranked by the named measured feature, or by directional overlap A-inside-B for a matched pair. Quartiles ARE NOT 0–25%, 25–50%, etc. absolute area fractions. If fewer than 4 eligible records exist, remaining quartiles are empty.',
-                    'Standalone displays: cyan circle = location of the exact selected ROI in the full aligned field; cyan cropped contour = the same ROI ID. ONLY ROIs in a final stable-matched pair are eligible. Raw pixel integrated intensity is summed over the COMPLETE selected ROI.',
+                    'Standalone displays: cyan circle = location of the exact selected ROI in the full aligned field; cyan cropped contour = the same ROI ID. ONLY ROIs in a final stable-matched pair are eligible. Raw pixel integrated intensity is summed over the COMPLETE selected ROI. Up to the requested number of exemplar ROIs are shown within each quartile.',
                     'Colocalization displays: each HORIZONTAL ROW has its own exact A ID and B ID; blue boundary = B ROI, red boundary = A ROI. Composite fluorescence A=red/B=green. Percentages are directional ROI pixel-area overlap (A in B vs B in A), copied from upstream HDF5. Stable matching is not rerun.',
                     'Integrated intensity (Σ) = direct sum of the original stored fluorescence pixels within the FULL matched ROI. Overlap Σ = direct sum of those pixel values at the intersection. No background correction or cross-condition gain normalization. Do not interpret fluorescence units as molecules.',
-                    'The CSV exports contain ONLY the displayed quartile exemplars, including the same ROI IDs and quartile labels shown inside this PDF. Summary charts still use the complete previously verified field metrics and highlight THIS field in black.',
+                    'The CSV exports contain ONLY the displayed quartile exemplars, including the same ROI IDs and quartile labels shown inside this PDF. Summary charts still use the complete previously verified field metrics and highlight THIS field in black. If a quartile contains fewer than the requested examples, all available members are shown.',
                 ]+provenance[:12])
             partial.replace(dest)
         except Exception:
@@ -677,13 +720,10 @@ def main(argv: list[str] | None = None) -> int:
             raise
         solo_csv=folder/f'{name}_displayed_single_roi_quartiles.csv'
         matched_csv=folder/f'{name}_displayed_stable_matched_pair_quartiles.csv'
-        pd.DataFrame(single_rows,columns=['field_index','sample','channel','quartile','rank_metric','rank_value',
-            'quartile_n','quartile_range_min','quartile_range_max','ROI_ObjectID','roi_pixel_count','Area_um2',
-            'mean_native_intensity','integrated_native_intensity_sum','Circularity','Solidity','Eccentricity']).to_csv(solo_csv,index=False)
-        matched_frame=pd.concat(matched_rows,ignore_index=True) if matched_rows else pd.DataFrame(
-            columns=['field_index','sample','pair','A_ObjectID','B_ObjectID','quartile',
-                     'A_roi_integrated_intensity_native_sum','B_roi_integrated_intensity_native_sum',
-                     'A_overlap_integrated_intensity_native_sum','B_overlap_integrated_intensity_native_sum'])
+        pd.DataFrame(single_rows, columns=['field_index', 'sample', 'channel', 'quartile', 'rank_metric', 'rank_value', 'quartile_n', 'quartile_range_min', 'quartile_range_max', 'display_order_within_quartile', 'displayed_examples_in_quartile', 'ROI_ObjectID', 'roi_pixel_count', 'Area_um2', 'mean_native_intensity', 'integrated_native_intensity_sum', 'Circularity', 'Solidity', 'Eccentricity']).to_csv(solo_csv, index=False)
+        matched_frame = pd.concat(matched_rows, ignore_index=True) if matched_rows else pd.DataFrame(
+            columns=['field_index','sample','pair','A_ObjectID','B_ObjectID','quartile','display_order_within_quartile','displayed_examples_in_quartile','A_roi_integrated_intensity_native_sum','B_roi_integrated_intensity_native_sum','A_overlap_integrated_intensity_native_sum','B_overlap_integrated_intensity_native_sum']
+        )
         matched_frame.to_csv(matched_csv,index=False)
         report_records.append({'index':entry['index'],'sample':entry['sample'],'source_field':entry['source_field'],
             'pdf':str(dest),'single_roi_displayed_csv':str(solo_csv),'stable_matched_displayed_csv':str(matched_csv),
