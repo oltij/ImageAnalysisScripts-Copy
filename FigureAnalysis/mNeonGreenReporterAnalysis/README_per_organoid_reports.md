@@ -1,255 +1,93 @@
-# Experiment 17 ventral organoid: one PDF per microscopy field
+# Experiment 17 ventral: concise per-field stable-matched QC PDFs
 
-`build_per_organoid_reports.py` is a **read-only report generator** for the existing
-`FigureAnalysis/mNeonGreenReporterAnalysis` workflow. It uses the exact selection,
-experimental metadata, and 20 quantitative measures implemented by sibling
-`plot_igf_exp17_ventral_with_gfp_plots.py`. It also reads final ROI pixel/metric
-CSVs and colocalization HDF5 files created by the committed general pipeline.
+`build_per_organoid_reports.py` is a **drop-in replacement** for the previous per-organoid report builder in `FigureAnalysis/mNeonGreenReporterAnalysis/`. It uses the adjacent existing `plot_igf_exp17_ventral_with_gfp_plots.py` and `igf_exp17_ventral_block_mapping.csv` unchanged.
 
-**It does not rerun or modify microscopy data, registration, CellProfiler,
-segmentation, filtering, nuclear assignments, or stable matching.**
+## Core design
 
-## Output layout
+One PDF **per microscope field**, grouped by sample-section (`151-3/`, etc.). It is a read-only visualization/export layer. It does not rerun or modify alignment, CellProfiler, ROI filtering, stable matching, or prior analyses. The original 400-page PDFs are left alone by default: new PDFs go to `mentor_field_plots/per_organoid_reports_quartiles/` and use `_organoid_report_quartiles.pdf` filenames. To regenerate any existing short PDF, pass `--overwrite`.
 
-```
-<out>/
-  report_manifest.csv
-  151-3/
-    Exp17_151-3_Set3_DAPI_GFP_LHX6_PV_Field_1_organoid_report.pdf
-    Exp17_151-3_Set3_DAPI_GFP_LHX6_PV_Field_1_colocalized_roi_integrated_intensity.csv
-  151-2/
-    ...
-  152-2/
-    ...
-```
+### Per-field pages
 
-Each PDF is **one microscopy field**, not all fields from a block pooled together.
-Fields are grouped under a sample-section folder (e.g. `151-3`) because one
-sample-section may contain multiple separately acquired fields. The `report_manifest.csv`
-records the exact input field and output paths.
+1. Cover: field, biological labels, anti-GFP status, final-match availability and cautions.
+2. Aligned full-field fluorescence: Hoechst, GFP, LHX6, PV (when present), with Hoechst-defined tissue outline.
+3. Standalone *final-stable-matched* ROI quartiles: one **landscape contact sheet per selected channel × ranking metric**. The default ranking is `Integrated intensity`, with one real ROI representing each nonempty rank quartile (Q1–Q4). Each row includes the field-wide position locator, the selected ROI's fluorescence crop and colored contour, the exact ROI ID, quartile range and number of eligible ROIs, and that SAME ROI's area, mean fluorescence, integrated fluorescence, circularity, solidity and eccentricity.
+4. Colocalization: one **four-row contact sheet per existing pair HDF5 with final stable matches**. Only `stable_matching` pairs are eligible, and there is exactly one representative final pair in each nonempty directional overlap rank quartile. Each row includes **Object B fluorescence with blue outline**, **Object A fluorescence with red outline**, **two-channel A-red/B-green composite**, exact **A/B ObjectIDs**, directional overlap percentages, matched area in pixels, full-ROI mean/integrated intensity for BOTH ROIs, and overlap-only integrated intensities for BOTH channels. Every value relates to the two IDs in the SAME row.
+5. Eight key IGF comparison charts (PV/LHX6 and GFP) showing **the exact current field outlined in black**; use `--all-summary-plots` for all 20 charts.
+6. Methods, provenance and legends.
 
-## Input selection (identical to the existing reporter-analysis script)
+Unmatched, best-partial-overlap, below-threshold, before/after and exhaustive pair-intensity pages are no longer assembled into the new PDF. `--append-existing-qc-pdfs` is deliberately rejected because it defeats the final-only scope. Older upstream QC files remain untouched on scratch.
 
-| Block | Cell line | IGF condition |
-|---|---|---|
-| 149 | CL32 | No IGF |
-| 150 | CL32 | +IGF |
-| 151 | H1 | +IGF |
-| 152 | CL23 | +IGF |
-| 153 | CL23 | No IGF |
-| 157 | H1 | No IGF |
+### What “quartiles” means here
 
-All fields must be **Experiment 17, ventral**. `-2` sample sections have anti-GFP
-staining; `-3` do not. Controls inferred from the inventory should be verified
-against laboratory records. Field indices 12/13 are excluded; H1 uses only the
-pre-existing verified H1 CSV. The source selector also validates that both
-production manifests refer to the same tiles and that downstream colocalization
-has completed. The active analysis directories are selected by the original
-script (earlier fields in original workspace; remaining fields in the later
-cleanup workspace).
+Quartiles are **equal-count rank quartiles**, sorted ascending by the selected ROI feature (for standalone pages) or the upstream **`A_Percent_Inside_B`** (for matched pair pages). One representative per quartile is selected deterministically at the center of each sorted bin; tied values are ordered by ObjectID. The **actual observed measurement range and number of candidates within that quartile** are printed for every shown ROI/pair. A quartile can be empty if there are fewer than four eligible records. Thus Q1–Q4 are **not** absolute overlap ranges 0–25%, 25–50%, etc.; upstream numeric match thresholds are still unchanged.
 
-## Data sources
+For standalone quartiles, the allowed pool consists of **final filtered ROI IDs** that also occur in at least one existing final stable-match pair. The channel ROI IDs and recorded metrics come from `06_final_shape_filtered/<channel>/<channel>_ROI_pixels_FILTERED.csv` and `<channel>_kept_ROI_metrics.csv` respectively. If an ROI ID isn't in both files *and* a final stable match, it isn't eligible. This is a display filter, not new biological classification. Single-channel examples and pairwise examples are separate rank selections: **do not assume an ROI in one sheet is the same as a ROI in another sheet without checking the IDs**.
 
-Each job's `output_dir` is resolved from the production `manifest.json` and then
-its `analysis/` directory is examined. The path contract is:
+### Integrated fluorescence intensity
 
-```
-<analysis>/
-  run_manifest.json
-  00_max_projections/<CHANNEL>.tif                 # fallback source fluorescence
-  02_registration/<CHANNEL>/aligned_<CHANNEL>_max.tif
-  03_aligned_segmentation/Hoechst/OrganoidMask.tiff
-  06_final_shape_filtered/<CHANNEL>/
-      <CHANNEL>_ROI_pixels_FILTERED.csv
-      <CHANNEL>_kept_ROI_metrics.csv
-  07_nuclear_colocalization/<PAIR>/analysis.h5
-  08_marker_colocalization/<PAIR>/analysis.h5
+All displayed intensities are computed using the **actual original aligned TIFF pixels** (from the original colocalization HDF5 images for pair displays, and the aligned image for single-channel displays). Full-ROI integrated intensity is `sum(image[y, x] for all ROI pixels)`; mean is the corresponding raw average. Overlap-only intensity is the raw sum on the pixel intersection of the two displayed partner masks. Figures use display-only brightness stretching, *never* for these measurements. These values are uncorrected for camera/background, gain or anti-GFP amplification and are **not** comparable as molecule counts or absolute gain-controlled quantitative expression. The supplied ROI metrics CSV determines area/shape annotations. The numbers reflect only the **displayed** exemplars, not the distribution means of all objects.
+
+### Sample selection
+
+Same as the existing `plot_igf_exp17_ventral_with_gfp_plots.py`: Experiment 17 ventral blocks 149 (CL32 No IGF), 150 (CL32 +IGF), 151 (H1 +IGF), 152 (CL23 +IGF), 153 (CL23 No IGF), 157 (H1 No IGF); `-2` anti-GFP stained and `-3` no anti-GFP; verified H1 selection and exclusion of failed 12/13. Untreated block labels inferred from inventory require wet-lab confirmation. Do not treat multiple fields from the same sample block as biologically independent replicates.
+
+## Install / run
+
+The files should live together:
+
+```text
+FigureAnalysis/mNeonGreenReporterAnalysis/
+  build_per_organoid_reports.py       # replace old version
+  plot_igf_exp17_ventral_with_gfp_plots.py # keep existing
+  igf_exp17_ventral_block_mapping.csv     # keep existing
+  README_per_organoid_reports.md     # replace old version
+  tests/test_per_organoid_reports.py # replace old version
 ```
 
-`<CHANNEL>` includes GFP, LHX6, PV, and the Hoechst reference when present.
-The nuclear reference may be named `DAPI` or `Hoescht` in the mask directory.
-Actual path selection for a channel's fluorescence prefers an aligned TIFF,
-then a colocalization HDF5-embedded original registered image, and finally the
-`00_max_projections` TIFF (labeled as a possible alignment fallback).
+Python 3.10+ packages: `numpy`, `pandas`, `scipy`, `tifffile`, `matplotlib`, `h5py`. Running the synthetic test additionally requires `pytest` and PyMuPDF (imported as `fitz`). Run from the existing `ims-mosaic` environment on Great Lakes. Original analysis files must be accessible (not uploaded into GitHub).
 
-Every pair-specific `analysis.h5` is the **canonical saved analysis**, containing:
-`metadata/json`, `images/object_a_original`, `images/object_b_original`,
-`tables/object_a_pixels`, `tables/object_b_pixels`, `tables/stable_matching`, and
-`tables/overlap_results`. All ROI identities and final matching statuses come
-from these existing data; no matching is recomputed.
-
-Existing QC overlays, when available, are located at
-`<PAIR>/visualizations/<OBJECT>_ROI_before_filtering.tif` and corresponding
-`_after_filtering.tif` paths. The script inserts the before/after images in the
-report. With `--append-existing-qc-pdfs`, it can also append **verbatim** all
-existing PDFs under the current field's `05_intensity_report/`,
-`06_shape_reports/`, `07_nuclear_colocalization/`, and `08_marker_colocalization/`
-folders. This appendix option can drastically increase page count and file size.
-
-## PDF contents
-
-1. **Cover/provenance:** field ID, cell line, condition, stain status, interpretation.
-2. **Whole-fluorescence panels:** Hoechst, GFP, LHX6, PV in grayscale, with the
-   Hoechst-defined tissue border in **black** when the mask exists. Each channel
-   is independently display-stretched (1st–99th percentile) for visibility.
-3. **Standalone ROI bins:** for GFP, LHX6 and PV, sort final retained ROIs by
-   each requested metric, and divide the sorted IDs into **ten approximately
-   equal-count rank groups** (0–10%, 10–20%, …, 90–100%). Each populated group
-   has one whole-organoid fluorescence image overlaid with **yellow** outlines
-   for all other ROIs and **blue** outlines for sampled ROIs, plus up to
-   `--max-examples` individual ROI crops with grayscale fluorescence underneath.
-   Source values and actual object IDs are labeled.
-4. **Colocalization QC for every saved nuclear and marker pair:** original
-   before/after overlays (when present); pair metadata, original threshold,
-   and **absolute 10-percentage-point overlap groups** for final matched pairs,
-   A-only objects with best overlapping B context, and B-only objects with best
-   overlapping A context. Empty groups are omitted. The selected examples are
-   displayed as **Object B grayscale with a blue contour / Object A grayscale
-   with a red contour / red(A)-green(B) fluorescence composite with contours**.
-5. **Colocalized integrated intensity:** per-pair scatter plot and descriptive
-   statistics for every finally stable-matched pair. A CSV separately exports
-   the **complete, one-row-per-matched-pair** source values; no example sampling
-   affects intensity measurements.
-6. **All twenty comparison figures:** 14 PV/LHX6 and 6 GFP figures, with the
-   same underlying field values, conditions, cell-line panels, shared y-axis
-   scale, and color-by-sample scheme as the original plotting script. GFP
-   figures separately display anti-GFP `-2` and no-anti-GFP `-3` rows.
-   **Only the exact current field's marker is made larger and outlined in black.**
-7. **Methods/legends/provenance:** measurements, colors, source file paths,
-   rank-decile versus absolute-overlap-bin definitions, and statistical caveats.
-8. **Optional verbatim QC PDF appendix:** when requested, includes the existing
-   individual ROI intensity/shape and colocalization QC reports as source pages.
-
-## Colocalized integrated fluorescence intensity
-
-For each pair in `stable_matching`, with its Object-A and Object-B ROI masks:
-
-```
-A_roi_integrated_intensity_native_sum = Σ original_A_image[y,x] over ROI A pixels
-B_roi_integrated_intensity_native_sum = Σ original_B_image[y,x] over ROI B pixels
-A_overlap_integrated_intensity_native_sum = Σ original_A_image[y,x] over ROI A ∩ ROI B
-B_overlap_integrated_intensity_native_sum = Σ original_B_image[y,x] over ROI A ∩ ROI B
-```
-
-The export additionally includes object IDs, original image pixel counts,
-measured overlap pixels, both directional overlap percentages, sample/field ID,
-channel names, source HDF5, and ROI mean intensities. Numbers use the exact
-image-native fluorescence intensities written to HDF5; **no background
-subtraction, gain calibration, or photobleaching correction is applied here**.
-Summed values are not molecular counts. They should not be compared as
-absolute expression between antibody-amplified and non-amplified sections
-without additional technical validation. A given cell/ROI can be present in
-more than one pairwise HDF5, so do not add pair totals across analyses without
-accounting for repeated objects.
-
-## The two different “10%” definitions
-
-- **Single-channel ROI reports:** 10% **rank bins** according to the selected
-  metric, with roughly equal numbers of ROIs per bin. A bin labeled `70–80%`
-  is the 70th–80th percentile of the metric, **not** 70–80% of tissue area.
-- **Colocalization reports:** 10 **absolute directional overlap bins** in
-  percentage points. A bin labeled `70–80%` means 70–80% of the Object A ROI
-  pixels fall inside its selected Object B ROI (or B inside A for B-only QC).
-  This is not the proportion of organoid area. Colocalization classifications
-  are unchanged from the completed stable-matching step.
-
-## Dependencies
-
-Python 3.10+ and the existing `ims-mosaic` environment with `numpy`, `pandas`,
-`matplotlib`, `scipy`, `tifffile`, and `h5py`; `pypdf` is only needed for
-`--append-existing-qc-pdfs`. Running the synthetic test additionally requires
-`pytest` and PyMuPDF (imported as `fitz`). The report requires the existing
-sibling script:
-
-`FigureAnalysis/mNeonGreenReporterAnalysis/plot_igf_exp17_ventral_with_gfp_plots.py`
-
-and the companion `igf_exp17_ventral_block_mapping.csv`. There is no need to
-edit the original plotting script or rerun any upstream pipeline.
-
-## Run for one sample-section first (Great Lakes)
+### Pilot: one real field
 
 ```bash
 conda activate ims-mosaic
-REPO="$HOME/ImageAnalysisScripts-Copy"  # set to your current checkout location
-SCRIPT="$REPO/FigureAnalysis/mNeonGreenReporterAnalysis/build_per_organoid_reports.py"
+REPO="$HOME/ImageAnalysisScripts-Copy"
 W1="/scratch/parent_root/parent0/$USER/ims_folder_batches/igf_94_production_v2"
 W2="/scratch/parent_root/parent0/$USER/igf_organoids/production_94_remaining_cleanup_20261016"
-
-python "$SCRIPT" \
-  --h1-workspace "$W1" \
-  --remaining-workspace "$W2" \
-  --only-sample 151-3 \
-  --max-fields 1 \
-  --max-examples 3 \
-  --out "$W1/mentor_field_plots/per_organoid_reports"
+python "$REPO/FigureAnalysis/mNeonGreenReporterAnalysis/build_per_organoid_reports.py" \
+  --h1-workspace "$W1" --remaining-workspace "$W2" \
+  --only-sample 151-3 --max-fields 1
 ```
 
-This is a useful first-run check because even one field may generate many PDF
-pages. Once its PDF looks correct, omit `--only-sample` and `--max-fields` to
-process all eligible fields. If desired, use
-`--roi-metrics area,integrated_intensity` for a shorter but still quantitative
-ROI report; the default includes area, mean intensity, integrated intensity,
-circularity, solidity, and eccentricity.
+A new folder is created at `$W1/mentor_field_plots/per_organoid_reports_quartiles/151-3/` with field-named PDF and two CSVs.
 
-**Append the original completed ROI/colocalization PDFs, if desired:**
+### Every eligible field
 
 ```bash
-python "$SCRIPT" --h1-workspace "$W1" --remaining-workspace "$W2" \
-  --only-sample 151-3 --max-fields 1 --overwrite \
-  --append-existing-qc-pdfs
+python "$REPO/FigureAnalysis/mNeonGreenReporterAnalysis/build_per_organoid_reports.py" \
+  --h1-workspace "$W1" --remaining-workspace "$W2"
 ```
 
-Only run this optional appendix mode if scratch has adequate space: it may copy
-very large multipage QC PDFs into every field's report.
+Additional options: `--roi-metrics integrated_intensity,area` (adds one whole **quartile contact sheet** for each additional ranking, but still only one exemplar per quartile); `--all-summary-plots` (20 charts instead of 8); `--only-field "Field_1"`; `--out /scratch/.../custom_folder`; `--overwrite`; `--skip-summary-plots`; `--skip-single-rois`; `--skip-colocalization`; `--max-fields 1`. The old `--compact` is accepted but no longer needed; the new quartile design is always concise. `--max-examples` is accepted for old commands, but exactly one displayed exemplar per quartile is enforced to keep the PDF readable.
 
-**Transfer one sample-section directory to a Mac** (Mac Terminal):
+**Run substantial batches on a Great Lakes compute node via Slurm rather than running them unattended on a login node.** Test one field first because this implementation has not been validated on real Great Lakes source files.
+
+## CSV outputs and identity matching
+
+For every PDF, two CSV files are saved **under the same sample-section folder**:
+
+- `<field>_displayed_single_roi_quartiles.csv`: one row for each exact standalone ROI shown in a PDF row, including the ranking quartile, field index, channel, ROI ID and measurements.
+- `<field>_displayed_stable_matched_pair_quartiles.csv`: one row for each exact A/B pair shown, with matched ROI IDs, both directional overlaps and both raw fluorescence totals (full ROIs and overlap pixels).
+
+Only **displayed** objects occur in either CSV. The report folder also contains `report_manifest.csv` for all field reports generated in that invocation. Existing BigStitcher/raw microscopy files and prior QC are unchanged.
+
+## Tests
+
+From this folder or the repo root:
 
 ```bash
-mkdir -p "$HOME/Desktop/IGF_151-3_report"
-rsync -avhP \
-  oltij@greatlakes.arc-ts.umich.edu:/scratch/parent_root/parent0/oltij/ims_folder_batches/igf_94_production_v2/mentor_field_plots/per_organoid_reports/151-3/ \
-  "$HOME/Desktop/IGF_151-3_report/"
+python -m py_compile FigureAnalysis/mNeonGreenReporterAnalysis/build_per_organoid_reports.py
+python FigureAnalysis/mNeonGreenReporterAnalysis/build_per_organoid_reports.py --help
+python -m pytest -q FigureAnalysis/mNeonGreenReporterAnalysis/tests/test_per_organoid_reports.py
 ```
 
-## CLI reference
-
-```
---h1-workspace            Earlier original 94-field workspace (required)
---remaining-workspace     Rerun/cleanup workspace for later field outputs (required)
---sample-metadata         CSV; defaults to sibling mapping file
---h1-selection            Optional override of verified H1 fields CSV
---out                     Output root (default original workspace/mentor_field_plots/per_organoid_reports)
---only-sample             Restrict to one block-section, e.g. 151-3
---only-field              Restrict by acquisition-name substring
---max-fields              Limit fields for pilot runs
---max-examples            Up to 10 examples per populated 10% group (default 3)
---roi-metrics             Comma-separated ROI ranking metric keys
---skip-single-rois        Skip single-channel ROI decile section
---skip-colocalization     Skip colocalization images AND matched-intensity calculations
---skip-summary-plots      Skip 20 comparison figures
---append-existing-qc-pdfs Append original QC PDFs verbatim; pypdf required
---overwrite               Overwrite existing finished per-field report
-```
-
-## Testing and limitations
-
-- `python -m py_compile build_per_organoid_reports.py`
-- `python build_per_organoid_reports.py --help`
-- `pytest -q tests/test_per_organoid_reports.py` (synthetic, no lab data)
-
-The accompanying synthetic test verifies the HDF5 matching-table contract,
-ROI overlays, intensity arithmetic, 10% bins, highlighted plot rendering,
-and PDF extractability. **Synthetic images are not experimental results.**
-
-The script has not been executed on a real Great Lakes field in this package;
-actual field TIFF/HDF5 availability and PDF page count must be validated with
-`--max-fields 1` before bulk execution. Missing optional standalone ROI assets
-are explicitly labeled as unavailable. Invalid/missing required ROI identities
-and malformed HDF5 matching tables cause a clear failure rather than guessing.
-
-A report may contain hundreds of pages depending on the chosen ROI metrics,
-number of colocalization pairs, and density of populated bins. This is an
-intentional complete QC mode; reduce metrics, limit examples, or skip sections
-for smaller review copies. Every report retains the same source-label
-provenance as the original comparative analysis. Field dots in plots are nested
-inside biological samples; no new independent-replicate p-values are reported.
+The tests use **synthetic** microscopy arrays and HDF5; the example PDF used during development is **not biological data**. In deployment, always verify one real PDF and compare displayed ROI IDs, matched pair IDs, directional overlaps and integrated intensities to the upstream HDF5.

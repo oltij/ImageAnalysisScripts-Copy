@@ -81,33 +81,28 @@ def test_synthetic_end_to_end():
         assert len(intens)==2 and (intens['overlap_area_pixels']==6).all()
         assert intens['A_roi_integrated_intensity_native_sum'].gt(0).all()
         assert intens['B_overlap_integrated_intensity_native_sum'].gt(0).all()
+        allowed=mod.stable_ids_by_channel([h5p])
+        assert allowed['LHX6']=={1,2} and allowed['PV']=={11,12}
+        q=mod.quartile_representatives(pd.DataFrame([{'ObjectID':i,'Area_um2':i} for i in range(1,9)]),'Area_um2',['ObjectID'])
+        assert [int(row['ObjectID']) for _,row,_,_ in q]==[2,4,6,8]
+        # Genuine final stable matched pair example (exclude unmatched 3/13).
+        # ROI area/intensities and plots refer to the same A/B identifiers.
         pdf=root/'test_synthetic_report.pdf'
         with PdfPages(pdf) as out:
             mod.whole_page(out,analysis,[])
-            mod.single_roi_pages(out,analysis,'GFP',['area','integrated_intensity'],3,42,[])
-            mod.existing_pair_overlay_page(out,p,analysis)
-            ii=mod.colocalization_pages(out,p,3,42,0,'151-2')
-            mod.intensity_pages(out,p.name,ii)
-            # Bring through a fake reference plot module and actual artist highlighting.
-            from types import SimpleNamespace
-            plotmod=SimpleNamespace(CELL_LINE_ORDER=('H1','CL23','CL32'),CONDITIONS=('No IGF','+IGF'),
-                ANTI_GFP_ORDER=('Anti-GFP stained (-2)','No anti-GFP (-3)'), METRIC_LEGENDS={'gfp_density_per_mm2':'GFP ROI density.'})
-            rows=[]
-            for i,(line,condition,suffix) in enumerate([(l,c,sec) for l in plotmod.CELL_LINE_ORDER for c in plotmod.CONDITIONS for sec in ('-2','-3')]):
-                rows.append({'index':i,'sample':f'{150+i}{suffix}','cell_line':line,'condition':condition,
-                             'anti_gfp_status':plotmod.ANTI_GFP_ORDER[0 if suffix=='-2' else 1],
-                             'gfp_density_per_mm2':200+10*i})
-            frame=pd.DataFrame(rows)
-            mod.one_metric_page(out,frame,plotmod,'gfp_density_per_mm2','GFP density','ROIs/mm²',0,gfp=True)
-        assert pdf.stat().st_size>10000
-        # Text extraction confirms content and PDF integrity, not just a nonempty file.
+            rows=mod.roi_quartile_pages(out,analysis,'LHX6',['integrated_intensity'],{1,2},0,'151-3',[])
+            vals=mod.matched_pair_quartile_page(out,p,0,'151-3')
+        assert len(rows)==2
+        assert len(vals)==2 and set(vals['A_ObjectID'])=={1,2}
+        assert set(vals['B_ObjectID'])=={11,12}
         import fitz
         doc=fitz.open(pdf)
-        assert doc.page_count >= 7
-        content='\n'.join(page.get_text() for page in doc)
-        assert 'integrated native intensity' in content
-        assert 'ROI area' in content
-        assert 'black' in content.lower()
+        txt='\n'.join(page.get_text() for page in doc)
+        assert doc.page_count==3
+        assert 'FINAL stable-matched' in txt
+        assert 'Integrated fluorescence' in txt
+        assert 'ROI #1' in txt or 'ROI #2' in txt
+        assert 'Q1' in txt and 'Q2' in txt
         doc.close()
         # Integration: invoke CLI main() with a small stub for upstream field
         # selection while keeping the real TIFF/ROI/HDF5 readers and PDF writer.
@@ -135,13 +130,13 @@ def test_synthetic_end_to_end():
             code = mod.main(['--h1-workspace', str(root), '--remaining-workspace', str(root),
                              '--out', str(root/'reports'), '--only-sample','151-3',
                              '--max-fields','1', '--max-examples','1',
-                             '--roi-metrics','area'])
+                             '--roi-metrics','area','--compact'])
         finally:
             mod.HERE = orig_here
         assert code == 0
-        produced = root/'reports'/'151-3'/'Exp17_151-3_Set3_DAPI_GFP_LHX6_PV_Field_1_organoid_report.pdf'
+        produced = root/'reports'/'151-3'/'Exp17_151-3_Set3_DAPI_GFP_LHX6_PV_Field_1_organoid_report_quartiles.pdf'
         assert produced.is_file() and produced.stat().st_size>10000
-        intensity_csv = root/'reports'/'151-3'/'Exp17_151-3_Set3_DAPI_GFP_LHX6_PV_Field_1_colocalized_roi_integrated_intensity.csv'
-        assert len(pd.read_csv(intensity_csv)) == 2
+        intensity_csv = root/'reports'/'151-3'/'Exp17_151-3_Set3_DAPI_GFP_LHX6_PV_Field_1_displayed_stable_matched_pair_quartiles.csv'
+        assert len(pd.read_csv(intensity_csv)) == 2 and set(pd.read_csv(intensity_csv)['A_ObjectID'])=={1,2}
         assert (root/'reports'/'report_manifest.csv').is_file()
         print(f'Synthetic test passed: {pdf.stat().st_size} bytes')
