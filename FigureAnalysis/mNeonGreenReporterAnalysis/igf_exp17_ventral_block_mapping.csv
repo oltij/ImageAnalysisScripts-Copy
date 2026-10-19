@@ -1,0 +1,7 @@
+block_id,cell_line,condition,experiment_id,organoid_type,condition_basis,inventory_note
+149,CL32,No IGF,17,Ventral,inferred untreated (no IGF1 in inventory),PV32 Ruku
+150,CL32,+IGF,17,Ventral,explicit IGF1,PV32 Ruku IGF1; stored after drying one day late
+151,H1,+IGF,17,Ventral,explicit IGF1,H1 IGF1 Ruku
+152,CL23,+IGF,17,Ventral,explicit IGF1,PV23 Ruku IGF1
+153,CL23,No IGF,17,Ventral,inferred untreated (no IGF1 in inventory),PV23 Ruku
+157,H1,No IGF,17,Ventral,inferred untreated (no IGF1 in inventory),H1 Ruku

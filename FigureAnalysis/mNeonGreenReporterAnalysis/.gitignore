@@ -1,0 +1,18 @@
+# Generated figures and tables. Keep the tracked block mapping CSV.
+outputs/
+*.pdf
+*.png
+*.svg
+combined_field_cell_classes_pv_nuclear_area.csv
+combined_pv_nuclear_positive_single_roi_areas.csv
+sample_level_descriptive_summary.csv
+sample_metadata_used.csv
+field_selection_audit.csv
+
+# Large microscopy/intermediate data do not belong in this source directory.
+*.h5
+*.ims
+*.tif
+*.tiff
+*.zarr/
+*.n5/
