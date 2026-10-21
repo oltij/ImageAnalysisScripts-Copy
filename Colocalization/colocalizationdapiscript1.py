@@ -77,6 +77,13 @@ THRESHOLD = 0.25
 PIXEL_SIZE_X_UM = 0.312843137
 PIXEL_SIZE_Y_UM = 0.312836345
 
+# Optional downstream marker-marker constraint. The default False path is the
+# historical unconstrained analysis and intentionally preserves its behavior.
+NUCLEAR_IDENTITY_CONSTRAINT = False
+OBJECT_A_NUCLEAR_RESULTS_FILE = None
+OBJECT_B_NUCLEAR_RESULTS_FILE = None
+NUCLEAR_CONSTRAINT_AUDIT_CSV = None
+
 
 # ============================================================
 # HELPERS
@@ -156,6 +163,300 @@ def dataframe_from_bytes(h5: h5py.File, name: str) -> pd.DataFrame:
     return pd.read_csv(io.BytesIO(payload.tobytes()))
 
 
+def require_columns(df: pd.DataFrame, columns: set[str], label: str):
+    missing = columns - set(df.columns)
+    if missing:
+        raise ValueError(f"{label} is missing required columns: {sorted(missing)}")
+
+
+def normalized_xy_groups(df: pd.DataFrame, id_column: str, label: str):
+    require_columns(df, {id_column, "X", "Y"}, label)
+    work = df[[id_column, "X", "Y"]].copy()
+    for column in (id_column, "X", "Y"):
+        work[column] = pd.to_numeric(work[column], errors="raise").astype(int)
+    work = work.drop_duplicates().sort_values([id_column, "Y", "X"])
+    return {
+        int(object_id): tuple(map(tuple, group[["X", "Y"]].to_numpy(dtype=int)))
+        for object_id, group in work.groupby(id_column, sort=True)
+    }
+
+
+def unique_optional_int(group: pd.DataFrame, column: str):
+    if column not in group.columns:
+        return None, None
+    values = pd.to_numeric(group[column], errors="coerce").dropna().astype(int).unique()
+    if len(values) == 0:
+        return None, None
+    if len(values) > 1:
+        return None, f"multiple_{column}_values"
+    return int(values[0]), None
+
+
+def load_nuclear_assignment_context(
+    results_file: Path,
+    marker_name: str,
+    current_pixels: pd.DataFrame,
+    current_id_column: str,
+):
+    """Resolve current marker ROIs to canonical nuclei using coordinates.
+
+    Stage-local CellIDs and original marker ROI identifiers are supporting
+    provenance only. Exact Stage-07 marker pixel coordinates are the
+    authoritative identity relationship.
+    """
+    if results_file is None or not Path(results_file).is_file():
+        raise FileNotFoundError(
+            f"Missing Stage-07 nuclear assignment HDF5 for {marker_name}: {results_file}"
+        )
+    results_file = Path(results_file)
+    with h5py.File(results_file, "r") as h5:
+        metadata = json.loads(h5["metadata/json"][()].decode("utf-8"))
+        source_marker = dataframe_from_bytes(h5, "object_a_pixels")
+        source_nuclear = dataframe_from_bytes(h5, "object_b_pixels")
+        mapping = dataframe_from_bytes(h5, "cell_id_mapping")
+        filtered_marker = dataframe_from_bytes(h5, "filtered_object_a_pixels")
+        marker_image_shape = tuple(h5["images/object_a_original"].shape)
+        nuclear_image_shape = tuple(h5["images/object_b_original"].shape)
+
+    source_a_name = metadata["objects"]["object_a_name"]
+    nuclear_name = metadata["objects"]["object_b_name"]
+    if source_a_name != marker_name:
+        raise ValueError(
+            f"{results_file}: expected Stage-07 Object A {marker_name!r}, found {source_a_name!r}"
+        )
+    require_columns(
+        mapping,
+        {"CellID", "A_ObjectID", "B_ObjectID"},
+        f"{results_file} cell_id_mapping",
+    )
+    mapping = mapping[["CellID", "A_ObjectID", "B_ObjectID"]].copy()
+    for column in mapping.columns:
+        mapping[column] = pd.to_numeric(mapping[column], errors="raise").astype(int)
+    for column in mapping.columns:
+        if mapping[column].duplicated().any():
+            raise ValueError(
+                f"{results_file}: Stage-07 {column} is not one-to-one; canonical assignment is ambiguous"
+            )
+
+    source_groups = normalized_xy_groups(
+        source_marker, "ObjectID", f"{results_file} marker pixels"
+    )
+    nuclear_groups = normalized_xy_groups(
+        source_nuclear, "ObjectID", f"{results_file} nuclear pixels"
+    )
+    filtered_groups = normalized_xy_groups(
+        filtered_marker, "CellID", f"{results_file} filtered marker pixels"
+    )
+    mapping_by_cell = mapping.set_index("CellID")
+    mapping_by_marker = mapping.set_index("A_ObjectID")
+
+    for row in mapping.itertuples(index=False):
+        marker_id = int(row.A_ObjectID)
+        cell_id = int(row.CellID)
+        nuclear_id = int(row.B_ObjectID)
+        if marker_id not in source_groups or cell_id not in filtered_groups:
+            raise ValueError(
+                f"{results_file}: mapping row CellID={cell_id}, marker={marker_id} lacks source pixels"
+            )
+        if source_groups[marker_id] != filtered_groups[cell_id]:
+            raise ValueError(
+                f"{results_file}: Stage-07 filtered CellID {cell_id} does not reproduce marker ObjectID {marker_id} coordinates"
+            )
+        if nuclear_id not in nuclear_groups:
+            raise ValueError(
+                f"{results_file}: canonical nuclear ObjectID {nuclear_id} is absent from nuclear pixels"
+            )
+
+    matched_marker_ids = set(mapping["A_ObjectID"].astype(int))
+    coordinate_to_marker_ids: dict[tuple, list[int]] = {}
+    for marker_id in sorted(matched_marker_ids):
+        coordinate_to_marker_ids.setdefault(source_groups[marker_id], []).append(marker_id)
+
+    current_groups = normalized_xy_groups(
+        current_pixels, "ObjectID", f"current {marker_name} pixels"
+    )
+    assignment_rows = []
+    for current_id, coordinates in current_groups.items():
+        current_group = current_pixels[current_pixels["ObjectID"].astype(int) == current_id]
+        input_roi, roi_error = unique_optional_int(current_group, "ROI")
+        input_cell, cell_error = unique_optional_int(current_group, "CellID")
+        coordinate_candidates = coordinate_to_marker_ids.get(coordinates, [])
+
+        identifier_candidates = set()
+        if input_roi is not None and input_roi in mapping_by_marker.index:
+            identifier_candidates.add(int(input_roi))
+        if input_cell is not None and input_cell in mapping_by_cell.index:
+            identifier_candidates.add(int(mapping_by_cell.loc[input_cell, "A_ObjectID"]))
+        if current_id_column == "ROI" and current_id in mapping_by_marker.index:
+            identifier_candidates.add(int(current_id))
+        if current_id_column == "CellID" and current_id in mapping_by_cell.index:
+            identifier_candidates.add(int(mapping_by_cell.loc[current_id, "A_ObjectID"]))
+
+        source_marker_id = None
+        source_cell_id = None
+        canonical_nuclear_id = None
+        status = "resolved"
+        if roi_error or cell_error:
+            status = roi_error or cell_error
+        elif len(coordinate_candidates) == 0:
+            status = "missing_coordinate_identity"
+        elif len(coordinate_candidates) > 1:
+            status = "ambiguous_coordinate_identity"
+        else:
+            source_marker_id = int(coordinate_candidates[0])
+            if identifier_candidates and identifier_candidates != {source_marker_id}:
+                status = "identifier_coordinate_mismatch"
+                source_marker_id = None
+            else:
+                source_row = mapping_by_marker.loc[source_marker_id]
+                source_cell_id = int(source_row["CellID"])
+                canonical_nuclear_id = int(source_row["B_ObjectID"])
+
+        assignment_rows.append(
+            {
+                "Current_ObjectID": int(current_id),
+                "Input_ID_Column": current_id_column,
+                "Input_ROI": input_roi,
+                "Input_CellID": input_cell,
+                "Stage07_Marker_ObjectID": source_marker_id,
+                "Stage07_Source_CellID": source_cell_id,
+                "Canonical_Nuclear_ObjectID": canonical_nuclear_id,
+                "Coordinate_Verified": status == "resolved",
+                "Mapping_Status": status,
+            }
+        )
+
+    assignments = pd.DataFrame(
+        assignment_rows,
+        columns=[
+            "Current_ObjectID", "Input_ID_Column", "Input_ROI", "Input_CellID",
+            "Stage07_Marker_ObjectID", "Stage07_Source_CellID",
+            "Canonical_Nuclear_ObjectID", "Coordinate_Verified", "Mapping_Status",
+        ],
+    )
+    return {
+        "results_file": results_file,
+        "metadata": metadata,
+        "marker_name": marker_name,
+        "nuclear_name": nuclear_name,
+        "marker_image_shape": marker_image_shape,
+        "nuclear_image_shape": nuclear_image_shape,
+        "pixel_size_um": metadata.get("pixel_size_um", {}),
+        "nuclear_pixels": source_nuclear[["ObjectID", "X", "Y"]].copy(),
+        "assignments": assignments,
+    }
+
+
+def validate_nuclear_contexts(context_a: dict, context_b: dict):
+    if context_a["nuclear_name"] != context_b["nuclear_name"]:
+        raise ValueError(
+            "Stage-07 sources use different nuclear channels: "
+            f"{context_a['nuclear_name']} vs {context_b['nuclear_name']}"
+        )
+    if context_a["nuclear_image_shape"] != context_b["nuclear_image_shape"]:
+        raise ValueError("Stage-07 sources use different nuclear image dimensions")
+    if context_a["marker_image_shape"] != context_a["nuclear_image_shape"] or context_b["marker_image_shape"] != context_b["nuclear_image_shape"]:
+        raise ValueError("Stage-07 marker and nuclear images do not share one coordinate canvas")
+
+    for axis in ("x", "y"):
+        a_value = float(context_a["pixel_size_um"].get(axis, np.nan))
+        b_value = float(context_b["pixel_size_um"].get(axis, np.nan))
+        if not np.isfinite(a_value) or not np.isfinite(b_value) or not np.isclose(a_value, b_value):
+            raise ValueError(f"Stage-07 sources use incompatible {axis}-pixel calibration")
+
+    def canonical_nuclear_table(context):
+        table = context["nuclear_pixels"].copy()
+        for column in ("ObjectID", "X", "Y"):
+            table[column] = pd.to_numeric(table[column], errors="raise").astype(int)
+        return table.drop_duplicates().sort_values(["ObjectID", "Y", "X"]).reset_index(drop=True)
+
+    if not canonical_nuclear_table(context_a).equals(canonical_nuclear_table(context_b)):
+        raise ValueError(
+            "Stage-07 sources do not contain the same canonical nuclear segmentation/ObjectID coordinate table"
+        )
+
+
+def build_nuclear_constraint_audit(
+    overlap_df: pd.DataFrame,
+    assignments_a: pd.DataFrame,
+    assignments_b: pd.DataFrame,
+) -> pd.DataFrame:
+    columns = [
+        "A_ObjectID", "B_ObjectID", "A_Current_ObjectID", "B_Current_ObjectID",
+        "A_Stage07_Marker_ObjectID", "B_Stage07_Marker_ObjectID",
+        "A_Stage07_Source_CellID", "B_Stage07_Source_CellID",
+        "A_Canonical_Nuclear_ObjectID", "B_Canonical_Nuclear_ObjectID",
+        "A_Mapping_Status", "B_Mapping_Status", "A_Coordinate_Verified", "B_Coordinate_Verified",
+        "Same_Nucleus", "A_Percent_Inside_B", "B_Percent_Inside_A",
+        "Original_Overlap_Threshold_Pass", "Nuclear_Constraint_Pass",
+        "Final_Constrained_Eligibility", "Final_Constrained_Stable_Match",
+        "Exclusion_Reason",
+    ]
+    if overlap_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    a_lookup = assignments_a.set_index("Current_ObjectID").to_dict("index")
+    b_lookup = assignments_b.set_index("Current_ObjectID").to_dict("index")
+    rows = []
+    for overlap in overlap_df.itertuples(index=False):
+        a_id = int(overlap.A_ObjectID)
+        b_id = int(overlap.B_ObjectID)
+        a_assignment = a_lookup.get(a_id)
+        b_assignment = b_lookup.get(b_id)
+        a_status = "missing_current_object" if a_assignment is None else a_assignment["Mapping_Status"]
+        b_status = "missing_current_object" if b_assignment is None else b_assignment["Mapping_Status"]
+        a_resolved = a_status == "resolved"
+        b_resolved = b_status == "resolved"
+        resolved = a_resolved and b_resolved
+        a_nucleus = (
+            int(a_assignment["Canonical_Nuclear_ObjectID"])
+            if a_resolved else None
+        )
+        b_nucleus = (
+            int(b_assignment["Canonical_Nuclear_ObjectID"])
+            if b_resolved else None
+        )
+        same_nucleus = bool(a_nucleus == b_nucleus) if resolved else pd.NA
+        threshold_pass = bool(overlap.Eligible)
+        nuclear_pass = bool(resolved and same_nucleus)
+        final_eligible = bool(threshold_pass and nuclear_pass)
+        if not threshold_pass:
+            reason = "below_directional_overlap_threshold"
+        elif not resolved:
+            reason = f"unresolved_nuclear_assignment:A={a_status};B={b_status}"
+        elif not same_nucleus:
+            reason = "different_canonical_nuclear_objectids"
+        else:
+            reason = ""
+        rows.append(
+            {
+                "A_ObjectID": a_id,
+                "B_ObjectID": b_id,
+                "A_Current_ObjectID": a_id,
+                "B_Current_ObjectID": b_id,
+                "A_Stage07_Marker_ObjectID": None if a_assignment is None else a_assignment["Stage07_Marker_ObjectID"],
+                "B_Stage07_Marker_ObjectID": None if b_assignment is None else b_assignment["Stage07_Marker_ObjectID"],
+                "A_Stage07_Source_CellID": None if a_assignment is None else a_assignment["Stage07_Source_CellID"],
+                "B_Stage07_Source_CellID": None if b_assignment is None else b_assignment["Stage07_Source_CellID"],
+                "A_Canonical_Nuclear_ObjectID": a_nucleus,
+                "B_Canonical_Nuclear_ObjectID": b_nucleus,
+                "A_Mapping_Status": a_status,
+                "B_Mapping_Status": b_status,
+                "A_Coordinate_Verified": False if a_assignment is None else bool(a_assignment["Coordinate_Verified"]),
+                "B_Coordinate_Verified": False if b_assignment is None else bool(b_assignment["Coordinate_Verified"]),
+                "Same_Nucleus": same_nucleus,
+                "A_Percent_Inside_B": float(overlap.A_Percent_Inside_B),
+                "B_Percent_Inside_A": float(overlap.B_Percent_Inside_A),
+                "Original_Overlap_Threshold_Pass": threshold_pass,
+                "Nuclear_Constraint_Pass": nuclear_pass,
+                "Final_Constrained_Eligibility": final_eligible,
+                "Final_Constrained_Stable_Match": False,
+                "Exclusion_Reason": reason,
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
 # ============================================================
 # LOAD OBJECTS
 # ============================================================
@@ -178,6 +479,29 @@ total_b_objects = len(all_b_ids)
 
 print(f"\nTotal {OBJECT_A_NAME} objects: {total_a_objects:,}")
 print(f"Total {OBJECT_B_NAME} objects: {total_b_objects:,}")
+
+constraint_context_a = None
+constraint_context_b = None
+constraint_audit_df = pd.DataFrame()
+
+if NUCLEAR_IDENTITY_CONSTRAINT:
+    print("\nResolving canonical nuclear identities from Stage-07 analyses...")
+    constraint_context_a = load_nuclear_assignment_context(
+        OBJECT_A_NUCLEAR_RESULTS_FILE,
+        OBJECT_A_NAME,
+        object_a,
+        object_a_original_id_column,
+    )
+    constraint_context_b = load_nuclear_assignment_context(
+        OBJECT_B_NUCLEAR_RESULTS_FILE,
+        OBJECT_B_NAME,
+        object_b,
+        object_b_original_id_column,
+    )
+    validate_nuclear_contexts(constraint_context_a, constraint_context_b)
+    for label, context in ((OBJECT_A_NAME, constraint_context_a), (OBJECT_B_NAME, constraint_context_b)):
+        counts = context["assignments"]["Mapping_Status"].value_counts().to_dict()
+        print(f"{label} Stage-07 provenance status: {counts}")
 
 
 # ============================================================
@@ -293,11 +617,36 @@ else:
         ]
     )
 
-if len(overlap_df) == 0:
+if len(overlap_df) == 0 and not NUCLEAR_IDENTITY_CONSTRAINT:
     raise RuntimeError(
         f"No overlapping pixels were found between "
         f"{OBJECT_A_NAME} and {OBJECT_B_NAME}."
     )
+
+if NUCLEAR_IDENTITY_CONSTRAINT:
+    constraint_audit_df = build_nuclear_constraint_audit(
+        overlap_df,
+        constraint_context_a["assignments"],
+        constraint_context_b["assignments"],
+    )
+    if len(overlap_df):
+        constraint_columns = [
+            "A_ObjectID", "B_ObjectID",
+            "A_Stage07_Marker_ObjectID", "B_Stage07_Marker_ObjectID",
+            "A_Stage07_Source_CellID", "B_Stage07_Source_CellID",
+            "A_Canonical_Nuclear_ObjectID", "B_Canonical_Nuclear_ObjectID",
+            "A_Mapping_Status", "B_Mapping_Status",
+            "A_Coordinate_Verified", "B_Coordinate_Verified", "Same_Nucleus",
+            "Original_Overlap_Threshold_Pass", "Nuclear_Constraint_Pass",
+            "Final_Constrained_Eligibility", "Exclusion_Reason",
+        ]
+        overlap_df = overlap_df.drop(columns=["Eligible"]).merge(
+            constraint_audit_df[constraint_columns],
+            on=["A_ObjectID", "B_ObjectID"],
+            how="left",
+            validate="one_to_one",
+        )
+        overlap_df["Eligible"] = overlap_df["Final_Constrained_Eligibility"].astype(bool)
 
 eligible_df = overlap_df[
     overlap_df["Eligible"]
@@ -310,17 +659,20 @@ print(
     f"{len(eligible_df):,}"
 )
 
-print(
-    f"\nMaximum {OBJECT_A_NAME} percentage inside "
-    f"{OBJECT_B_NAME}: "
-    f"{overlap_df['A_Percent_Inside_B'].max():.2f}%"
-)
+if len(overlap_df):
+    print(
+        f"\nMaximum {OBJECT_A_NAME} percentage inside "
+        f"{OBJECT_B_NAME}: "
+        f"{overlap_df['A_Percent_Inside_B'].max():.2f}%"
+    )
 
-print(
-    f"Median {OBJECT_A_NAME} percentage inside "
-    f"{OBJECT_B_NAME}: "
-    f"{overlap_df['A_Percent_Inside_B'].median():.2f}%"
-)
+    print(
+        f"Median {OBJECT_A_NAME} percentage inside "
+        f"{OBJECT_B_NAME}: "
+        f"{overlap_df['A_Percent_Inside_B'].median():.2f}%"
+    )
+else:
+    print("\nNo spatially overlapping marker pairs were found; constrained outputs will be empty.")
 
 
 # ============================================================
@@ -528,6 +880,32 @@ matched_a_ids = set(
 matched_b_ids = set(
     matching_df["B_ObjectID"].astype(int)
 ) if len(matching_df) else set()
+
+if NUCLEAR_IDENTITY_CONSTRAINT:
+    matched_keys = set(
+        zip(
+            matching_df["A_ObjectID"].astype(int),
+            matching_df["B_ObjectID"].astype(int),
+        )
+    ) if len(matching_df) else set()
+    if len(constraint_audit_df):
+        constraint_audit_df["Final_Constrained_Stable_Match"] = [
+            (int(row.A_ObjectID), int(row.B_ObjectID)) in matched_keys
+            for row in constraint_audit_df.itertuples(index=False)
+        ]
+        eligible_not_matched = (
+            constraint_audit_df["Final_Constrained_Eligibility"].astype(bool)
+            & ~constraint_audit_df["Final_Constrained_Stable_Match"].astype(bool)
+        )
+        constraint_audit_df.loc[
+            eligible_not_matched, "Exclusion_Reason"
+        ] = "not_selected_by_constrained_stable_matching"
+    if NUCLEAR_CONSTRAINT_AUDIT_CSV is not None:
+        audit_path = Path(NUCLEAR_CONSTRAINT_AUDIT_CSV)
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        audit_temp = audit_path.with_suffix(audit_path.suffix + ".tmp")
+        constraint_audit_df.to_csv(audit_temp, index=False)
+        audit_temp.replace(audit_path)
 
 
 # ============================================================
@@ -770,7 +1148,11 @@ summary_rows = [
     ),
     ("Matched CellIDs", len(cell_id_mapping), "cells"),
     (
-        f"{OBJECT_A_NAME} objects below threshold",
+        (
+            f"{OBJECT_A_NAME} objects without a constrained-eligible partner"
+            if NUCLEAR_IDENTITY_CONSTRAINT
+            else f"{OBJECT_A_NAME} objects below threshold"
+        ),
         len(below_threshold_a_ids),
         "objects"
     ),
@@ -839,8 +1221,13 @@ for marker_name, total_n, overlap_n, eligible_n, matched_n in [
             {
                 "Marker": marker_name,
                 "Stage": (
-                    f"Participating in eligible pair "
-                    f"(A >= {THRESHOLD * 100:.0f}% inside B)"
+                    (
+                        f"Participating in eligible pair "
+                        f"(A >= {THRESHOLD * 100:.0f}% inside B and same canonical nucleus)"
+                        if NUCLEAR_IDENTITY_CONSTRAINT
+                        else f"Participating in eligible pair "
+                        f"(A >= {THRESHOLD * 100:.0f}% inside B)"
+                    )
                 ),
                 "Count": int(eligible_n)
             },
@@ -882,6 +1269,18 @@ if a_original.shape != b_original.shape:
         f"{OBJECT_A_NAME}: {a_original.shape}\n"
         f"{OBJECT_B_NAME}: {b_original.shape}"
     )
+
+if NUCLEAR_IDENTITY_CONSTRAINT:
+    if tuple(a_original.shape) != tuple(constraint_context_a["marker_image_shape"]):
+        raise ValueError(
+            f"Current {OBJECT_A_NAME} fluorescence canvas {a_original.shape} does not match "
+            f"its Stage-07 source {constraint_context_a['marker_image_shape']}"
+        )
+    if tuple(b_original.shape) != tuple(constraint_context_b["marker_image_shape"]):
+        raise ValueError(
+            f"Current {OBJECT_B_NAME} fluorescence canvas {b_original.shape} does not match "
+            f"its Stage-07 source {constraint_context_b['marker_image_shape']}"
+        )
 
 height, width = a_original.shape
 
@@ -939,6 +1338,34 @@ metadata = {
     }
 }
 
+if NUCLEAR_IDENTITY_CONSTRAINT:
+    metadata["analysis_variant"] = "nucleus_constrained_marker_marker"
+    metadata["nuclear_identity_constraint"] = {
+        "enabled": True,
+        "applied_before_preference_lists": True,
+        "canonical_identity": "Stage-07 nuclear Object B ObjectID",
+        "unresolved_assignment_policy": "exclude with explicit audit reason",
+        "object_a_stage07_results_file": str(OBJECT_A_NUCLEAR_RESULTS_FILE),
+        "object_b_stage07_results_file": str(OBJECT_B_NUCLEAR_RESULTS_FILE),
+        "audit_csv": (
+            None if NUCLEAR_CONSTRAINT_AUDIT_CSV is None
+            else str(NUCLEAR_CONSTRAINT_AUDIT_CSV)
+        ),
+        "same_nuclear_segmentation_verified_by": (
+            "exact ObjectID/X/Y nuclear pixel table, image dimensions, and pixel calibration"
+        ),
+        "marker_identity_verified_by": (
+            "exact current-to-Stage-07 marker ROI pixel coordinates; ROI and CellID are provenance checks only"
+        ),
+    }
+    metadata["identifier_definitions"] = {
+        "current_marker_objectid": "ObjectID used by this marker-marker run",
+        "stage07_marker_objectid": "original marker ROI ObjectID in the marker-vs-nuclear run",
+        "stage07_source_cellid": "run-local CellID assigned by that marker-vs-nuclear run",
+        "canonical_nuclear_objectid": "Stage-07 nuclear Object B ObjectID; cross-marker identity anchor",
+        "output_cellid": "run-local CellID assigned only to this constrained marker-marker result",
+    }
+
 print("\nWriting single analysis results file:")
 print(RESULTS_FILE)
 
@@ -972,6 +1399,18 @@ with h5py.File(RESULTS_FILE, "w") as h5:
     store_dataframe(h5, "unmatched_object_a", unmatched_df)
     store_dataframe(h5, "summary_statistics", summary_df)
     store_dataframe(h5, "filtering_stage_counts", filtering_stage_df)
+    if NUCLEAR_IDENTITY_CONSTRAINT:
+        store_dataframe(
+            h5,
+            "nuclear_assignments_object_a",
+            constraint_context_a["assignments"],
+        )
+        store_dataframe(
+            h5,
+            "nuclear_assignments_object_b",
+            constraint_context_b["assignments"],
+        )
+        store_dataframe(h5, "nuclear_constraint_audit", constraint_audit_df)
 
 
 # ============================================================
@@ -999,8 +1438,12 @@ print(
 
 print(f"\nMatched CellIDs: {len(cell_id_mapping):,}")
 print(
-    f"{OBJECT_A_NAME} below threshold: "
-    f"{len(below_threshold_a_ids):,}"
+    (
+        f"{OBJECT_A_NAME} without a constrained-eligible partner: "
+        if NUCLEAR_IDENTITY_CONSTRAINT
+        else f"{OBJECT_A_NAME} below threshold: "
+    )
+    + f"{len(below_threshold_a_ids):,}"
 )
 
 if pd.notna(organoid_area_mm2):
@@ -1028,4 +1471,3 @@ print("DONE")
 print("=" * 70)
 print("\nThe visualization script now needs ONLY:")
 print(RESULTS_FILE)
-

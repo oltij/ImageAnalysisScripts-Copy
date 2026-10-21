@@ -237,6 +237,8 @@ filtering_stage_df = data["filtering_stage_df"]
 OBJECT_A_NAME = metadata["objects"]["object_a_name"]
 OBJECT_B_NAME = metadata["objects"]["object_b_name"]
 THRESHOLD = metadata["matching"]["threshold"]
+ANALYSIS_VARIANT = metadata.get("analysis_variant", "unconstrained_marker_marker")
+IS_NUCLEUS_CONSTRAINED = ANALYSIS_VARIANT == "nucleus_constrained_marker_marker"
 
 PIXEL_SIZE_X_UM = metadata["pixel_size_um"]["x"]
 PIXEL_SIZE_Y_UM = metadata["pixel_size_um"]["y"]
@@ -250,6 +252,8 @@ print("=" * 70)
 print("COLocalization visualization stage")
 print("=" * 70)
 print(f"\nAnalysis file:\n{RESULTS_FILE}")
+if IS_NUCLEUS_CONSTRAINED:
+    print("\nMatching variant: NUCLEUS-CONSTRAINED")
 print(f"\nVisualization output directory:\n{OUTPUT_DIR}")
 
 
@@ -815,7 +819,11 @@ if len(matching_df) > 0:
             ax_combined.axis("off")
 
         fig.suptitle(
-            f"Random {OBJECT_A_NAME}-{OBJECT_B_NAME} Matched Cells",
+            (
+                "NUCLEUS-CONSTRAINED: "
+                if IS_NUCLEUS_CONSTRAINED else ""
+            )
+            + f"Random {OBJECT_A_NAME}-{OBJECT_B_NAME} Matched Cells",
             fontsize=18,
             fontweight="bold",
             y=0.995
@@ -867,6 +875,31 @@ if len(matching_df) > 0:
 
 else:
     print("\nNo matched pairs available.")
+    if IS_NUCLEUS_CONSTRAINED:
+        with PdfPages(visualization_pdf) as pdf:
+            fig = plt.figure(figsize=(11, 6.5))
+            fig.text(
+                0.08,
+                0.78,
+                f"{OBJECT_A_NAME}–{OBJECT_B_NAME}: NUCLEUS-CONSTRAINED matching",
+                fontsize=18,
+                fontweight="bold",
+            )
+            fig.text(
+                0.08,
+                0.56,
+                "No final stable-matched pairs were produced.",
+                fontsize=14,
+            )
+            fig.text(
+                0.08,
+                0.36,
+                "See analysis.h5 and nuclear_constraint_pair_audit.csv for explicit\n"
+                "overlap-threshold, canonical-nuclear-identity, and exclusion provenance.",
+                fontsize=11,
+            )
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
 
 
 # ============================================================
@@ -5513,4 +5546,3 @@ for path in [
 print("\n" + "=" * 70)
 print("DONE")
 print("=" * 70)
-

@@ -47,7 +47,7 @@ The production-specific 94-field workflow remains separately documented in
 
 This README describes the end-to-end workflow for a tiled microscopy acquisition consisting of four unstitched fields/quadrants and one to four fluorescence channels.
 
-The document is organized around **eight pipeline steps**. Those eight steps are the authoritative processing order. The four larger phases describe what the pipeline is doing conceptually; they do **not** add extra processing steps.
+The document is organized around **nine pipeline steps**. Those nine steps are the authoritative processing order. The four larger phases describe what the pipeline is doing conceptually; they do **not** add extra processing steps.
 
 ### Legacy fixed-reporter IMS controller
 
@@ -106,11 +106,13 @@ ROI → CELL
  v
 PUTATIVE CELL TYPES
  |
- └── STEP 8. Marker colocalization to define pairwise
-              marker-positive / putative cell-type relationships
+ ├── STEP 8. Unconstrained marker colocalization to define pairwise
+ │            marker-positive / putative cell-type relationships
+ └── STEP 9. Independently recomputed nucleus-constrained marker
+              colocalization for the same configured pairs
 ```
 
-### The eight steps, in order
+### The nine steps, in order
 
 1. **`.ims processing → stitched image`** — export the IMS fields, trim storage padding, apply BaSiC, stitch/fuse each channel with BigStitcher, and generate max projections.
 2. **Initial segmentation of ROI per marker** — run CellProfiler on each unaligned max projection to obtain the masks/centroids needed for registration.
@@ -119,7 +121,8 @@ PUTATIVE CELL TYPES
 5. **Apply intensity visualization + filter** — inspect intensity distributions and perform the first ROI-scrubbing pass using intensity only.
 6. **Apply shape-based filter** — inspect geometry only after the intensity gate, then apply the final shape/area gate to the intensity-passing ROI population.
 7. **Apply nuclear colocalization for ROI → Cell identity** — match each marker ROI to a nuclear ROI. The persistent cross-run identity anchor is the **nuclear ObjectID**; pairwise `CellID` values remain run-local.
-8. **Marker colocalization for putative cell types** — compare the nuclear-associated marker populations to one another, then generate pairwise QC and, when desired, all-nuclear-cell A+/B+, A+/B−, A−/B+, A−/B− summaries.
+8. **Unconstrained marker colocalization for putative cell types** — compare the nuclear-associated marker populations with the established directional-overlap threshold and stable-matching implementation, then generate pairwise QC and the distinct Stage-07-derived all-nuclear-cell summaries.
+9. **Nucleus-constrained marker colocalization** — independently repeat the same marker-marker matching after restricting eligible candidates to coordinate-verified marker ROIs assigned to the same canonical Stage-07 nuclear ObjectID. Stage 08 remains intact and both variants run by default.
 
 ### Handoff rule
 
@@ -139,8 +142,12 @@ final intensity+shape-filtered ROI table
     is the input to nuclear colocalization
 
 nuclear-associated marker populations
-    are the input to marker-marker colocalization
+    are the input to both independent marker-marker matching variants
 ```
+
+See [`Colocalization/README_03_nucleus_constrained_matching.md`](Colocalization/README_03_nucleus_constrained_matching.md)
+for the Stage-09 scientific definition, provenance validation, outputs,
+comparison tables, resume behavior, tests, and Great Lakes example.
 
 This ordering is important because changing coordinate frame, resegmentation, or filtering changes which ROI representation is valid downstream.
 
@@ -218,7 +225,7 @@ This is discussed in detail in the colocalization section.
 
 ---
 
-The environment is setup infrastructure, not one of the eight biological/image-processing steps. Establish it first, then enter Step 1.
+The environment is setup infrastructure, not one of the nine biological/image-processing steps. Establish it first, then enter Step 1.
 
 Two Conda environments are used:
 
@@ -2264,13 +2271,13 @@ later all-nuclear-cell summary.
 
 This phase compares the **nuclear-associated marker populations** produced in Step 7.
 
-It contains **Step 8 of 8**.
+It contains **Steps 8 and 9 of 9**.
 
 The output is not a new universal cell identity namespace. Instead, marker-marker overlap/matching defines pairwise marker relationships that can be interpreted as putative multi-marker cell classes under the chosen segmentation and overlap criteria.
 
 ---
 
-## Step 8 of 8 — Marker colocalization
+## Step 8 of 9 — Unconstrained marker colocalization
 
 ---
 
@@ -2295,6 +2302,9 @@ optional all-nuclear-cell A+/B+, A+/B−, A−/B+, A−/B− classification
 ```
 
 For the all-nuclear-cell summary, the visualization stage reuses the two original marker↔nucleus HDF5 files from Step 7. It does **not** infer global identity from equality of pairwise `CellID` values.
+
+This established Stage-08 run is preserved unchanged. Its output remains under
+`analysis/08_marker_colocalization/<A>_vs_<B>/`.
 
 ---
 
@@ -2347,6 +2357,33 @@ A-/B-
 ```
 
 fractions of all nuclear cells.
+
+---
+
+## Step 9 of 9 — Nucleus-constrained marker colocalization
+
+For every configured Stage-08 marker pair, the controller also runs an
+independent marker-marker stable matching under:
+
+```text
+analysis/09_marker_colocalization_nucleus_constrained/<A>_vs_<B>/
+```
+
+It uses the same marker inputs, fluorescence images, directional overlap
+threshold, calibration, preference ranking, and A-proposing Gale-Shapley
+algorithm as Stage 08. Before preference lists are built, however, a candidate
+must resolve by exact ROI pixel coordinates to both Stage-07 sources and both
+source assignments must name the same canonical nuclear ObjectID. Run-local
+CellIDs and coincident numeric ROI values are never used as proof of identity.
+
+Stage 09 stores a candidate-level identity/eligibility audit and writes direct
+Stage-08-versus-Stage-09 CSV/PDF/PNG comparisons. Because matching is rerun on
+the reduced graph, a constrained final pair need not be a subset of the
+unconstrained final matching. The all-nuclei A+/B+ classification remains the
+separate Stage-07-derived result described below.
+
+Full details are in
+[`Colocalization/README_03_nucleus_constrained_matching.md`](Colocalization/README_03_nucleus_constrained_matching.md).
 
 ---
 
@@ -2555,7 +2592,7 @@ relevant summary CSVs.
 
 ---
 
-## The complete eight-step flow
+## The complete nine-step flow
 
 ---
 
@@ -2615,11 +2652,18 @@ ROI → CELL
        v
 PUTATIVE CELL TYPES
 │
-└── STEP 8 — marker colocalization
-       nuclear-positive marker A ↔ nuclear-positive marker B
-       → pairwise marker relationships
-       → QC / summaries
-       → optional all-nuclear-cell four-class table
+├── STEP 8 — unconstrained marker colocalization
+│      nuclear-positive marker A ↔ nuclear-positive marker B
+│      → original pairwise stable matching
+│      → QC / summaries
+│      → Stage-07-derived all-nuclear-cell four-class table
+│
+└── STEP 9 — nucleus-constrained marker colocalization
+       same marker inputs and threshold
+       → exact Stage-07 ROI/nuclear provenance validation
+       → same-nucleus eligibility before preference lists
+       → independently recomputed stable matching
+       → separate QC and Stage-08 comparison
 ```
 
 ---
@@ -2742,18 +2786,22 @@ Experiment/
 │   ├── MarkerB_vs_Nuclear/
 │   └── MarkerC_vs_Nuclear/
 │
-├── 08_nuclear_positive_marker_cells/
-│   ├── MarkerA_nuclear_positive_cells.csv
-│   ├── MarkerB_nuclear_positive_cells.csv
-│   └── MarkerC_nuclear_positive_cells.csv
+├── 08_marker_colocalization/
+│   ├── MarkerA_vs_MarkerB/
+│   │   └── visualizations/
+│   │       └── unmatched_only_qc/
+│   │           ├── *_final_summary_metrics.csv
+│   │           ├── *_all_nuclear_cells_classification.csv
+│   │           └── *_all_nuclear_cells_class_counts.csv
+│   ├── MarkerA_vs_MarkerC/
+│   └── MarkerB_vs_MarkerC/
 │
-└── 09_marker_marker_colocalization/
+└── 09_marker_colocalization_nucleus_constrained/
     ├── MarkerA_vs_MarkerB/
-    │   └── visualizations/
-    │       └── unmatched_only_qc/
-    │           ├── *_final_summary_metrics.csv
-    │           ├── *_all_nuclear_cells_classification.csv
-    │           └── *_all_nuclear_cells_class_counts.csv
+    │   ├── analysis.h5
+    │   ├── nuclear_constraint_pair_audit.csv
+    │   ├── visualizations/
+    │   └── comparison_to_unconstrained/
     ├── MarkerA_vs_MarkerC/
     └── MarkerB_vs_MarkerC/
 ```

@@ -3,9 +3,10 @@
 This is the production-specific application for the audited IGF experiment.
 Independent datasets should start with the
 [`GeneralPipeline` documentation](../GeneralPipeline/README.md). The general
-interface is additive: these IGF entry points, paths, run plan, and scientific
-configuration remain unchanged so existing production manifests and submitted
-jobs continue to use the committed implementation that created them.
+interface is additive: the IGF entry points and paths remain stable, while the
+checked-in configuration and run-plan checksum now enable the additional
+Stage 09 for newly prepared workspaces. Existing prepared manifests and
+submitted jobs remain commit-pinned to the implementation that created them.
 
 This directory contains the production Great Lakes orchestration around the
 repository's existing microscopy pipeline. It starts from each field's four
@@ -17,7 +18,10 @@ original `.ims` tiles and runs the established workflow:
 4. initial CellProfiler segmentation for registration anchors
 5. CASTalign registration
 6. segmentation again in the aligned coordinate system
-7. shared DAPI-tissue-mask QC, ROI filtering, matching, and colocalization
+7. shared DAPI-tissue-mask QC, ROI filtering, nuclear matching, and the
+   preserved unconstrained marker-marker colocalization
+8. independent nucleus-constrained marker-marker colocalization and direct
+   comparison with the unconstrained result
 
 The wrappers do not replace, optimize, or change those scientific algorithms.
 
@@ -32,7 +36,8 @@ logs are retained; original Turbo `.ims` files are never cleanup targets.
 Prepared production workspaces are commit-pinned and contain controller
 compatibility copies. Do not edit those copies or pull a new repository commit
 under an active manifest. Prepare a fresh scratch workspace from the cleanup
-commit to apply this default to a new set of remaining acquisitions.
+and Stage-09 commit to apply these defaults to a new set of remaining
+acquisitions.
 
 ## Committed files
 
@@ -42,8 +47,8 @@ commit to apply this default to a new set of remaining acquisitions.
 - `submit_production_batches.py`: the production 94-field submission as two
   dependent arrays of 47.
 - `run_folder_batch.sbatch`: the validated Great Lakes per-field job profile.
-- `configs/ims_mge_generic.example.json`: the unchanged production scientific
-  configuration.
+- `configs/ims_mge_generic.example.json`: the production scientific
+  configuration with all prior settings preserved and Stage 09 enabled.
 - `configs/production_94_fields.json`: the audited sessions, expected counts,
   channel mapping, and configuration checksum for the 94-field run.
 
@@ -340,6 +345,21 @@ It preserves native IMS resolution and voxel calibration,
 `analysis_downsampling.factor=1`, 2×2 stitching, existing BaSiC and BigStitcher
 parameters, CellProfiler segmentation and shared DAPI mask, ROI filters,
 matching, colocalization, and report generation.
+
+New workspaces also run both marker-pair variants by default through:
+
+```json
+"nucleus_constrained_marker_matching": true
+```
+
+The original Stage 08 remains under `analysis/08_marker_colocalization/`.
+Stage 09 is written separately under
+`analysis/09_marker_colocalization_nucleus_constrained/`, with coordinate-
+verified Stage-07 nuclear provenance, a pair audit, the same visualization
+workflow, and a direct variant comparison. Valid resume treats the two stages
+independently. The existing all-nuclei marker-coexpression summary is still
+derived from Stage 07 and is not a Stage-09 match count. See
+[`../Colocalization/README_03_nucleus_constrained_matching.md`](../Colocalization/README_03_nucleus_constrained_matching.md).
 
 IGF registration remains exactly:
 

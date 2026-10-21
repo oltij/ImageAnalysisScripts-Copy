@@ -175,6 +175,9 @@ def _validate_analysis(analysis: Any, repository: Path) -> dict[str, Any]:
         fail(f"analysis.reports may contain only {sorted(allowed_reports)}")
     if any(not isinstance(value, bool) for value in reports.values()):
         fail("Every analysis.reports value must be boolean")
+    constrained_matching = analysis.get("nucleus_constrained_marker_matching", True)
+    if not isinstance(constrained_matching, bool):
+        fail("analysis.nucleus_constrained_marker_matching must be boolean")
     return json.loads(json.dumps(analysis))
 
 

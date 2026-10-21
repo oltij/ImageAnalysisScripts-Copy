@@ -282,8 +282,29 @@ run_stitched_pipeline.py
 It retains the established order: initial CellProfiler segmentation,
 CASTalign, final segmentation in registered coordinates, one final nuclear
 tissue mask shared by marker segmentations, ROI extraction, intensity and
-shape filtering, nuclear-anchored matching, marker-pair colocalization, and QC.
-The generic wrapper does not alter those algorithms or numerical settings.
+shape filtering, nuclear-anchored matching, the original unconstrained
+marker-pair colocalization, and QC. By default it then adds an independently
+recomputed nucleus-constrained marker-pair Stage 09. The new stage restricts
+candidates to the same coordinate-verified Stage-07 canonical nuclear
+ObjectID before reusing the unchanged preference and Gale-Shapley logic. It
+does not replace Stage 08 or the separate Stage-07-derived all-nuclei
+coexpression classification.
+
+The optional analysis setting below is `true` by default and is included in
+the example configurations:
+
+```json
+"nucleus_constrained_marker_matching": true
+```
+
+Outputs remain separate under `analysis/08_marker_colocalization/` and
+`analysis/09_marker_colocalization_nucleus_constrained/`. A completed Stage 08
+does not suppress a missing Stage 09 during a valid resume. See
+[`../Colocalization/README_03_nucleus_constrained_matching.md`](../Colocalization/README_03_nucleus_constrained_matching.md)
+for definitions, audit and comparison files, zero-match behavior, and the
+reporter option.
+
+The generic wrapper does not alter the existing numerical settings.
 
 ## Already-stitched IMS limitation
 

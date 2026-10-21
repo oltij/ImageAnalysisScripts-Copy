@@ -89,7 +89,8 @@ def fluorescence_image(analysis: Path, channel: str) -> tuple[np.ndarray, str] |
     # The H5 from each colocalization run contains the exact registered TIFF
     # used for the matching calculation, so prefer it over a raw projection.
     for p in sorted(list((analysis / "07_nuclear_colocalization").glob("*/analysis.h5")) +
-                    list((analysis / "08_marker_colocalization").glob("*/analysis.h5"))):
+                    list((analysis / "08_marker_colocalization").glob("*/analysis.h5")) +
+                    list((analysis / "09_marker_colocalization_nucleus_constrained").glob("*/analysis.h5"))):
         with h5py.File(p, "r") as h5:
             meta = json.loads(h5["metadata/json"][()].decode())
             objects = meta["objects"]
@@ -397,6 +398,7 @@ class PairData:
     overlaps: pd.DataFrame
     threshold: float
     source: Path
+    variant: str
 
 
 def load_pair(path: Path) -> PairData:
@@ -417,8 +419,31 @@ def load_pair(path: Path) -> PairData:
     expected_cols = {"A_ObjectID", "B_ObjectID"}
     if not expected_cols.issubset(matching.columns) or not expected_cols.issubset(overlaps.columns):
         raise ValueError(f"{path}: missing A_ObjectID/B_ObjectID in matching or overlap table")
-    return PairData(f"{a} vs {b}", a, b, ia, ib, aa, bb, matching, overlaps,
-                    float(meta["matching"]["threshold_percent"]), path)
+    variant = meta.get("analysis_variant", "unconstrained")
+    display_name = (
+        f"{a} vs {b} [NUCLEUS-CONSTRAINED]"
+        if variant == "nucleus_constrained_marker_marker"
+        else f"{a} vs {b}"
+    )
+    return PairData(display_name, a, b, ia, ib, aa, bb, matching, overlaps,
+                    float(meta["matching"]["threshold_percent"]), path, variant)
+
+
+def colocalization_files(analysis: Path, marker_pair_variant: str) -> list[Path]:
+    nuclear = sorted((analysis / "07_nuclear_colocalization").glob("*/analysis.h5"))
+    if marker_pair_variant == "unconstrained":
+        marker = sorted((analysis / "08_marker_colocalization").glob("*/analysis.h5"))
+    elif marker_pair_variant == "nucleus-constrained":
+        marker = sorted(
+            (analysis / "09_marker_colocalization_nucleus_constrained").glob("*/analysis.h5")
+        )
+        if not marker:
+            raise FileNotFoundError(
+                f"No Stage-09 nucleus-constrained marker-pair analysis.h5 files under {analysis}"
+            )
+    else:
+        raise ValueError(f"Unknown marker-pair variant: {marker_pair_variant}")
+    return nuclear + marker
 
 
 def intensity_rows(pair: PairData, field_index: int, sample: str, selected_matches: pd.DataFrame | None = None) -> pd.DataFrame:
@@ -629,6 +654,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument('--skip-colocalization',action='store_true')
     ap.add_argument('--skip-summary-plots',action='store_true')
     ap.add_argument('--all-summary-plots',action='store_true',help='Include all 20 comparison figures instead of 8 core figures')
+    ap.add_argument(
+        '--marker-pair-variant',
+        choices=('unconstrained', 'nucleus-constrained'),
+        default='unconstrained',
+        help='Marker-pair result tree to report; variants are written to separate output files',
+    )
     ap.add_argument('--compact',action='store_true',help='Backward-compatible alias; concise quartiles are now the default')
     ap.add_argument('--append-existing-qc-pdfs',action='store_true',help='Unsupported in quartile-only reports to avoid unmatched/below-threshold pages')
     ap.add_argument('--overwrite',action='store_true')
@@ -655,18 +686,19 @@ def main(argv: list[str] | None = None) -> int:
     chosen=chosen.sort_values('index')
     if args.max_fields:chosen=chosen.head(args.max_fields)
     if chosen.empty:raise ValueError('No eligible Experiment 17 ventral fields match requested filters')
-    out=(args.out or original/'mentor_field_plots/per_organoid_reports_quartiles').expanduser().resolve()
+    variant_suffix = '_nucleus_constrained' if args.marker_pair_variant == 'nucleus-constrained' else ''
+    out=(args.out or original/f'mentor_field_plots/per_organoid_reports_quartiles{variant_suffix}').expanduser().resolve()
     LOGGER.info('Creating %d field reports (final stable matched, Q1..Q4)',len(chosen))
     report_records=[]
     for entry in chosen.to_dict('records'):
         name=re.sub(r'[^A-Za-z0-9_.-]+','_',Path(entry['source_field']).name).strip('_')
-        folder=out/entry['sample'];dest=folder/f'{name}_organoid_report_quartiles.pdf'
+        folder=out/entry['sample'];dest=folder/f'{name}_organoid_report_quartiles{variant_suffix}.pdf'
         if dest.exists() and not args.overwrite:
             LOGGER.info('Existing report, skipping: %s (use --overwrite)',dest)
             continue
         folder.mkdir(parents=True,exist_ok=True)
         analysis=Path(entry['output_dir'])
-        files=sorted((analysis/'07_nuclear_colocalization').glob('*/analysis.h5'))+sorted((analysis/'08_marker_colocalization').glob('*/analysis.h5'))
+        files=colocalization_files(analysis, args.marker_pair_variant)
         # Read each pair's stored final match identities. No new matching occurs.
         stable=stable_ids_by_channel(files)
         single_rows=[];matched_rows=[];provenance=[]
@@ -676,6 +708,7 @@ def main(argv: list[str] | None = None) -> int:
                 note_page(pdf,f'Exp 17 · {entry["sample"]} · Field {entry["index"]}',[
                     f'Source: {entry["source_field"]}',
                     f'{entry["cell_line"]} | {entry["condition"]} | {entry["anti_gfp_status"]} | Ventral organoid',
+                    f'Marker-pair report variant: {args.marker_pair_variant.upper()}. Stage-07 marker–nuclear pages retain their original definition.',
                     'This PDF represents ONE microscope field, not all fields in its sample-section.',
                     'Final stable matches ONLY: standalone ROI examples must participate in at least one final upstream stable match. Colocalization examples are final one-to-one matched pairs only. No unmatched or below-threshold displays.',
                     'A row of images, IDs and numeric measurements always refers to exactly the SAME selected ROI or A/B PAIR. Each rank quartile Q1–Q4 displays up to the requested number of real exemplars, chosen to span that quartile.',
@@ -718,14 +751,15 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             partial.unlink(missing_ok=True)
             raise
-        solo_csv=folder/f'{name}_displayed_single_roi_quartiles.csv'
-        matched_csv=folder/f'{name}_displayed_stable_matched_pair_quartiles.csv'
+        solo_csv=folder/f'{name}_displayed_single_roi_quartiles{variant_suffix}.csv'
+        matched_csv=folder/f'{name}_displayed_stable_matched_pair_quartiles{variant_suffix}.csv'
         pd.DataFrame(single_rows, columns=['field_index', 'sample', 'channel', 'quartile', 'rank_metric', 'rank_value', 'quartile_n', 'quartile_range_min', 'quartile_range_max', 'display_order_within_quartile', 'displayed_examples_in_quartile', 'ROI_ObjectID', 'roi_pixel_count', 'Area_um2', 'mean_native_intensity', 'integrated_native_intensity_sum', 'Circularity', 'Solidity', 'Eccentricity']).to_csv(solo_csv, index=False)
         matched_frame = pd.concat(matched_rows, ignore_index=True) if matched_rows else pd.DataFrame(
             columns=['field_index','sample','pair','A_ObjectID','B_ObjectID','quartile','display_order_within_quartile','displayed_examples_in_quartile','A_roi_integrated_intensity_native_sum','B_roi_integrated_intensity_native_sum','A_overlap_integrated_intensity_native_sum','B_overlap_integrated_intensity_native_sum']
         )
         matched_frame.to_csv(matched_csv,index=False)
         report_records.append({'index':entry['index'],'sample':entry['sample'],'source_field':entry['source_field'],
+            'marker_pair_variant':args.marker_pair_variant,
             'pdf':str(dest),'single_roi_displayed_csv':str(solo_csv),'stable_matched_displayed_csv':str(matched_csv),
             'n_pair_hdf5':len(files),'displayed_single_roi':len(single_rows),'displayed_final_pairs':len(matched_frame)})
         LOGGER.info('Saved %s | standalone ROI exemplars=%d | final matched pair exemplars=%d',dest,len(single_rows),len(matched_frame))

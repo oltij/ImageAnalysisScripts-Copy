@@ -184,6 +184,7 @@ When wavelength metadata are available for every channel, the metadata report re
         ├── 06_final_shape_filtered/
         ├── 07_nuclear_colocalization/
         ├── 08_marker_colocalization/
+        ├── 09_marker_colocalization_nucleus_constrained/
         ├── run.log
         └── run_manifest.json
 ```
