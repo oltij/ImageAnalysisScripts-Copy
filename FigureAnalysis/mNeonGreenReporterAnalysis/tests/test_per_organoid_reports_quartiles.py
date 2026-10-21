@@ -2,6 +2,7 @@
 import importlib.util
 import io
 import json
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -75,6 +76,20 @@ def test_synthetic_end_to_end():
             h.create_dataset('images/object_b_original',data=image*2)
             for key,frame in {'object_a_pixels':pd.DataFrame(ap),'object_b_pixels':pd.DataFrame(bp),'stable_matching':matching,'overlap_results':overlaps}.items():
                 h.create_dataset('tables/'+key,data=np.frombuffer(frame.to_csv(index=False).encode(),dtype='uint8'))
+        stage09=analysis/'09_marker_colocalization_nucleus_constrained'/'LHX6_vs_PV'/'analysis.h5'
+        stage09.parent.mkdir(parents=True)
+        shutil.copy2(h5p,stage09)
+        constrained_meta=dict(meta,analysis_variant='nucleus_constrained_marker_marker')
+        with h5py.File(stage09,'r+') as h:
+            del h['metadata/json']
+            h.create_dataset('metadata/json',data=np.bytes_(json.dumps(constrained_meta)))
+        assert h5p in mod.colocalization_files(analysis,'unconstrained')
+        assert stage09 not in mod.colocalization_files(analysis,'unconstrained')
+        assert stage09 in mod.colocalization_files(analysis,'nucleus-constrained')
+        assert h5p not in mod.colocalization_files(analysis,'nucleus-constrained')
+        constrained_pair=mod.load_pair(stage09)
+        assert constrained_pair.variant=='nucleus_constrained_marker_marker'
+        assert '[NUCLEUS-CONSTRAINED]' in constrained_pair.name
         p=mod.load_pair(h5p)
         assert len(p.matching)==2
         intens=mod.intensity_rows(p,0,'151-2')
@@ -141,4 +156,23 @@ def test_synthetic_end_to_end():
         intensity_csv = root/'reports'/'151-3'/'Exp17_151-3_Set3_DAPI_GFP_LHX6_PV_Field_1_displayed_stable_matched_pair_quartiles.csv'
         assert len(pd.read_csv(intensity_csv)) == 2 and set(pd.read_csv(intensity_csv)['A_ObjectID'])=={1,2}
         assert (root/'reports'/'report_manifest.csv').is_file()
+        # The Stage-09 variant is independently selected, clearly named, and
+        # cannot overwrite the default Stage-08 report or exemplar CSV.
+        mod.HERE = root
+        try:
+            constrained_code = mod.main([
+                '--h1-workspace', str(root), '--remaining-workspace', str(root),
+                '--out', str(root/'reports_constrained'), '--only-sample', '151-3',
+                '--max-fields', '1', '--max-examples', '10',
+                '--marker-pair-variant', 'nucleus-constrained',
+                '--skip-single-rois', '--skip-summary-plots',
+            ])
+        finally:
+            mod.HERE = orig_here
+        assert constrained_code == 0
+        constrained_report = root/'reports_constrained'/'151-3'/'Exp17_151-3_Set3_DAPI_GFP_LHX6_PV_Field_1_organoid_report_quartiles_nucleus_constrained.pdf'
+        constrained_csv = root/'reports_constrained'/'151-3'/'Exp17_151-3_Set3_DAPI_GFP_LHX6_PV_Field_1_displayed_stable_matched_pair_quartiles_nucleus_constrained.csv'
+        assert constrained_report.is_file() and constrained_report.stat().st_size > 10000
+        assert len(pd.read_csv(constrained_csv)) == 2
+        assert produced.is_file() and intensity_csv.is_file()
         print(f'Synthetic test passed: {pdf.stat().st_size} bytes')

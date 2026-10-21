@@ -57,6 +57,7 @@ ANALYSIS_FILES = (
     "QC/organoid_mask_qc.py",
     "Colocalization/colocalizationdapiscript1.py",
     "Colocalization/colocalizationdapiscript2.py",
+    "Colocalization/compare_matching_variants.py",
 )
 
 EXPECTED_CP_PIPELINE_SETTINGS = (
@@ -528,6 +529,9 @@ def read_config(config_file: Path) -> dict:
         )
     if not all(isinstance(value, bool) for value in reports.values()):
         raise ValueError("Every reports setting must be true or false")
+    constrained_matching = raw.get("nucleus_constrained_marker_matching", True)
+    if not isinstance(constrained_matching, bool):
+        raise ValueError("nucleus_constrained_marker_matching must be true or false")
     output_value = raw.get("output_dir")
     if not isinstance(output_value, str) or not output_value.strip():
         raise ValueError("output_dir must be a nonempty path")
@@ -538,6 +542,7 @@ def read_config(config_file: Path) -> dict:
     result["_nuclear"] = nuclear
     result["_pipeline"] = pipeline
     result["_output"] = resolve_path(output_value, config_file.parent)
+    result["_nucleus_constrained_marker_matching"] = constrained_matching
     if result["_output"].exists() and not result["_output"].is_dir():
         raise ValueError(f"output_dir exists but is not a directory: {result['_output']}")
     return result
@@ -892,7 +897,8 @@ def run(cfg: dict, resume: bool) -> None:
     organoid = aligned_cp[nuc] / "MyExpt_FilterObjects.csv"
 
     def colocalize(label: str, a: str, b: str, a_csv: Path, b_csv: Path,
-                   directory: Path, threshold: float, nuclear_sources=None) -> Path:
+                   directory: Path, threshold: float, nuclear_sources=None,
+                   constraint_sources=None, constraint_audit_csv: Path | None = None) -> Path:
         h5path = directory / "analysis.h5"
         settings = {
             "OBJECT_A_NAME": repr(a), "OBJECT_B_NAME": repr(b),
@@ -902,7 +908,18 @@ def run(cfg: dict, resume: bool) -> None:
             "THRESHOLD": repr(float(threshold)),
             "PIXEL_SIZE_X_UM": repr(x), "PIXEL_SIZE_Y_UM": repr(y),
         }
-        r.patched(label, "Colocalization/colocalizationdapiscript1.py", settings, [h5path])
+        expected = [h5path]
+        if constraint_sources:
+            if constraint_audit_csv is None:
+                raise ValueError("A constrained colocalization requires an audit CSV path")
+            settings.update({
+                "NUCLEAR_IDENTITY_CONSTRAINT": "True",
+                "OBJECT_A_NUCLEAR_RESULTS_FILE": path_value(constraint_sources[0]),
+                "OBJECT_B_NUCLEAR_RESULTS_FILE": path_value(constraint_sources[1]),
+                "NUCLEAR_CONSTRAINT_AUDIT_CSV": path_value(constraint_audit_csv),
+            })
+            expected.append(constraint_audit_csv)
+        r.patched(label, "Colocalization/colocalizationdapiscript1.py", settings, expected)
         if reports.get("colocalization", True):
             viz_settings = {
                 "RESULTS_FILE": path_value(h5path), "OUTPUT_DIR": path_value(directory / "visualizations"),
@@ -933,10 +950,49 @@ def run(cfg: dict, resume: bool) -> None:
             r.save()
 
     for a, b in cfg["_pairs"]:
-        directory = r.out / "08_marker_colocalization" / f"{a}_vs_{b}"
-        colocalize(f"08_pair_{a}_{b}", a, b, associated_csv[a], associated_csv[b],
-                   directory, cfg["thresholds"]["marker_marker"],
-                   (nuclear_h5[a], nuclear_h5[b]))
+        unconstrained_directory = r.out / "08_marker_colocalization" / f"{a}_vs_{b}"
+        unconstrained_h5 = colocalize(
+            f"08_pair_{a}_{b}", a, b, associated_csv[a], associated_csv[b],
+            unconstrained_directory, cfg["thresholds"]["marker_marker"],
+            (nuclear_h5[a], nuclear_h5[b]),
+        )
+        if cfg["_nucleus_constrained_marker_matching"]:
+            constrained_directory = (
+                r.out
+                / "09_marker_colocalization_nucleus_constrained"
+                / f"{a}_vs_{b}"
+            )
+            audit_csv = constrained_directory / "nuclear_constraint_pair_audit.csv"
+            constrained_h5 = colocalize(
+                f"09_nucleus_constrained_pair_{a}_{b}",
+                a,
+                b,
+                associated_csv[a],
+                associated_csv[b],
+                constrained_directory,
+                cfg["thresholds"]["marker_marker"],
+                (nuclear_h5[a], nuclear_h5[b]),
+                (nuclear_h5[a], nuclear_h5[b]),
+                audit_csv,
+            )
+            comparison = constrained_directory / "comparison_to_unconstrained"
+            r.execute(
+                f"09_compare_{a}_{b}",
+                [
+                    sys.executable,
+                    str(ROOT / "Colocalization/compare_matching_variants.py"),
+                    "--unconstrained-h5", str(unconstrained_h5),
+                    "--constrained-h5", str(constrained_h5),
+                    "--output-dir", str(comparison),
+                ],
+                [
+                    comparison / "matching_variant_comparison.csv",
+                    comparison / "matching_variant_pair_details.csv",
+                    comparison / "discordant_unconstrained_final_pairs.csv",
+                    comparison / "matching_variant_comparison.pdf",
+                    comparison / "matching_variant_comparison.png",
+                ],
+            )
     print(f"\nFinished. Outputs and provenance: {r.out}\nManifest: {r.manifest}", flush=True)
 
 
@@ -977,6 +1033,8 @@ def main(argv: list[str] | None = None) -> int:
             print("  07  marker/nuclear matching and nuclear-positive exports")
         if cfg["_pairs"]:
             print("  08  requested marker/marker comparisons")
+            if cfg["_nucleus_constrained_marker_matching"]:
+                print("  09  independent nucleus-constrained marker/marker comparisons")
         if cfg.get("reports", {}).get("colocalization", True) and cfg["_markers"]:
             print("      colocalization visualizations/QC enabled")
         print(f"Nuclear: {cfg['_nuclear']}; channels: {list(cfg['_channels'])}")

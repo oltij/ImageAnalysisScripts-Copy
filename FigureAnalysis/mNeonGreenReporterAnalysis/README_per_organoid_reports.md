@@ -6,6 +6,14 @@
 
 One PDF **per microscope field**, grouped by sample-section (`151-3/`, etc.). It is a read-only visualization/export layer. It does not rerun or modify alignment, CellProfiler, ROI filtering, stable matching, or prior analyses. New PDFs go to `mentor_field_plots/per_organoid_reports_quartiles/` and use `_organoid_report_quartiles.pdf` filenames. To regenerate any existing short PDF, pass `--overwrite`.
 
+Marker-pair pages use the original unconstrained Stage-08 tree by default.
+Use `--marker-pair-variant nucleus-constrained` to build a separate report
+from Stage 09. That mode labels every marker pair `NUCLEUS-CONSTRAINED`, uses a
+separate default output directory, and adds `_nucleus_constrained` to every PDF
+and displayed-exemplar CSV name. It never mixes Stage-08 and Stage-09
+marker-pair HDF5 files. Stage-07 marker-nuclear pages remain available in both
+report variants and retain their original meaning.
+
 ### What changed in this replacement
 
 This version is designed to be much easier to read:
@@ -107,9 +115,24 @@ python "$REPO/FigureAnalysis/mNeonGreenReporterAnalysis/build_per_organoid_repor
   --h1-workspace "$W1" --remaining-workspace "$W2" --max-examples 10
 ```
 
+### Separate nucleus-constrained marker-pair reports
+
+```bash
+python "$REPO/FigureAnalysis/mNeonGreenReporterAnalysis/build_per_organoid_reports.py" \
+  --h1-workspace "$W1" --remaining-workspace "$W2" \
+  --marker-pair-variant nucleus-constrained --max-examples 10
+```
+
+This requires
+`analysis/09_marker_colocalization_nucleus_constrained/*/analysis.h5` for each
+field being reported and fails explicitly if no Stage-09 marker-pair result is
+present. The default remains `--marker-pair-variant unconstrained`.
+
 Useful options:
 
 - `--max-examples 10` (default): up to 10 displayed exemplars per quartile.
+- `--marker-pair-variant unconstrained|nucleus-constrained`: select one
+  marker-pair result tree; default is unconstrained.
 - `--roi-metrics integrated_intensity,area`: adds standalone quartile pages for additional ranking metrics.
 - `--all-summary-plots`: include all 20 summary charts.
 - `--only-field "Field_1"`

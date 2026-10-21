@@ -41,6 +41,7 @@
       ]
     },
     "pairs": "auto",
+    "nucleus_constrained_marker_matching": true,
     "thresholds": {
       "marker_nuclear": 0.25,
       "marker_marker": 0.25

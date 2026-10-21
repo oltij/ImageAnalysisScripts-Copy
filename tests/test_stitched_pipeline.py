@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -256,6 +257,27 @@ class StitchedPipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "duplicate"):
                 runner.read_config(config)
 
+    def test_nucleus_constrained_matching_defaults_on_and_validates_boolean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._write_config(
+                tmp,
+                {"DNA": "dna.tif", "A": "a.tif", "B": "b.tif"},
+                pairs=[["A", "B"]],
+            )
+            self.assertTrue(
+                runner.read_config(config)["_nucleus_constrained_marker_matching"]
+            )
+            raw = json.loads(config.read_text(encoding="utf-8"))
+            raw["nucleus_constrained_marker_matching"] = False
+            config.write_text(json.dumps(raw), encoding="utf-8")
+            self.assertFalse(
+                runner.read_config(config)["_nucleus_constrained_marker_matching"]
+            )
+            raw["nucleus_constrained_marker_matching"] = "yes"
+            config.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "must be true or false"):
+                runner.read_config(config)
+
     def test_tiff_preflight_and_projection(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -325,6 +347,36 @@ class StitchedPipelineTests(unittest.TestCase):
             cfg = runner.read_config(config_path)
             with self.assertRaisesRegex(RuntimeError, "analysis scripts changed"):
                 runner.Runner(cfg, resume=True)
+
+    def test_resume_treats_completed_stage08_and_missing_stage09_independently(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            stage08 = tmp / "08_marker_colocalization" / "A_vs_B" / "analysis.h5"
+            stage09 = tmp / "09_marker_colocalization_nucleus_constrained" / "A_vs_B" / "analysis.h5"
+            stage08.parent.mkdir(parents=True)
+            stage08.write_text("completed stage 08", encoding="utf-8")
+            instance = object.__new__(runner.Runner)
+            instance.completed = {"08_pair_A_B": [str(stage08)]}
+            instance.log = tmp / "run.log"
+            instance.save = mock.Mock()
+
+            with mock.patch.object(runner.subprocess, "Popen") as popen:
+                instance.execute("08_pair_A_B", ["must-not-run"], [stage08])
+                popen.assert_not_called()
+
+            instance.execute(
+                "09_nucleus_constrained_pair_A_B",
+                [
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; import sys; Path(sys.argv[1]).parent.mkdir(parents=True, exist_ok=True); Path(sys.argv[1]).write_text('completed stage 09')",
+                    str(stage09),
+                ],
+                [stage09],
+            )
+            self.assertTrue(stage09.is_file())
+            self.assertIn("09_nucleus_constrained_pair_A_B", instance.completed)
+            instance.save.assert_called_once()
 
     def test_full_orchestration_routes_each_handoff_in_order(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -447,6 +499,9 @@ class StitchedPipelineTests(unittest.TestCase):
                 "07_match_PV_viz",
                 "08_pair_LHX6_PV",
                 "08_pair_LHX6_PV_viz",
+                "09_nucleus_constrained_pair_LHX6_PV",
+                "09_nucleus_constrained_pair_LHX6_PV_viz",
+                "09_compare_LHX6_PV",
             ]
             self.assertEqual(labels, expected_labels)
 
@@ -485,6 +540,17 @@ class StitchedPipelineTests(unittest.TestCase):
             marker_pair = calls_by_label["08_pair_LHX6_PV"]
             self.assertIn("LHX6_nuclear_positive_cells.csv", marker_pair[3]["OBJECT_A_CSV"])
             self.assertIn("PV_nuclear_positive_cells.csv", marker_pair[3]["OBJECT_B_CSV"])
+            constrained_pair = calls_by_label["09_nucleus_constrained_pair_LHX6_PV"]
+            self.assertEqual(constrained_pair[3]["NUCLEAR_IDENTITY_CONSTRAINT"], "True")
+            self.assertIn("07_nuclear_colocalization/LHX6_vs_DNA/analysis.h5", constrained_pair[3]["OBJECT_A_NUCLEAR_RESULTS_FILE"])
+            self.assertIn("07_nuclear_colocalization/PV_vs_DNA/analysis.h5", constrained_pair[3]["OBJECT_B_NUCLEAR_RESULTS_FILE"])
+            self.assertIn("09_marker_colocalization_nucleus_constrained", constrained_pair[3]["RESULTS_FILE"])
+            constrained_viz = calls_by_label["09_nucleus_constrained_pair_LHX6_PV_viz"]
+            self.assertIn("09_marker_colocalization_nucleus_constrained", constrained_viz[3]["RESULTS_FILE"])
+            comparison = calls_by_label["09_compare_LHX6_PV"]
+            comparison_command = " ".join(comparison[2])
+            self.assertIn("08_marker_colocalization", comparison_command)
+            self.assertIn("09_marker_colocalization_nucleus_constrained", comparison_command)
 
 
 if __name__ == "__main__":

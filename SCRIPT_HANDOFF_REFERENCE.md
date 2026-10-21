@@ -17,12 +17,13 @@ This catalog documents the role of **every existing script** in the repository. 
 | `ROIFiltering/Circularity/circularityfilter.py` | Shape QC | same as above | shape PDFs and CSVs | Runs independently on same intensity-gated ROIs |
 | `ROIFiltering/Eccentricity/eccentricityfilter.py` | Shape QC | same as above | shape PDFs and CSVs | Runs independently on same intensity-gated ROIs |
 | `ROIFiltering/Solidity/solidityfilter.py` | Shape QC | same as above | shape PDFs and CSVs | Runs independently on same intensity-gated ROIs |
-| `Colocalization/colocalizationdapiscript1.py` | Nuclear association and pair analysis | A/B pixel CSV + A/B aligned TIFF + optional organoid CSV + overlap threshold | `analysis.h5` containing `tables/filtered_object_a_pixels`, mapping, overlap and summary tables | Run once per marker vs nucleus, then once per requested marker pair |
+| `Colocalization/colocalizationdapiscript1.py` | Nuclear association and pair analysis | A/B pixel CSV + A/B aligned TIFF + optional organoid CSV + overlap threshold; Stage 09 additionally receives both Stage-07 HDF5 files | `analysis.h5` containing pixels, mapping, overlap, preferences, stable matching, and summaries; Stage 09 adds verified nuclear assignments and a candidate audit | Run once per marker vs nucleus, once per requested unconstrained marker pair, then independently on the same pair after the same-canonical-nucleus candidate restriction |
 | `Colocalization/colocalizationdapiscript2.py` | QC, plots, all-nuclear summary | `analysis.h5`, optional two marker-vs-nucleus HDF5 files and organoid-area CSV | matched/unmatched PDFs, pair label TIFFs, population and all-cell tables | Runs after each HDF5; nuclear-summary flag off for marker-vs-nucleus, on for marker-vs-marker |
+| `Colocalization/compare_matching_variants.py` | Stage-09 comparison | matching Stage-08 and Stage-09 HDF5 files | summary/pair-detail/discordance CSVs and PDF/PNG comparison figure | Validates identical marker inputs/direction/threshold, then compares independently computed final matchings |
 
 ## Source documentation retained, but see the companion orchestration documentation
 
-- `README.md`: original eight-step workflow, including upstream IMS/BigStitcher route.
+- `README.md`: nine-step workflow, including upstream IMS/BigStitcher route and both marker-pair variants.
 - `IMS_WORKFLOW.md`: one-command IMS channel assignment, preprocessing, metadata, and downstream handoff.
 - `Stitching/README_IMS_Mosaic_Pipeline_updated(1).md`, `Stitching/README_TIFF_max_projection.md`: optional upstream TIFF processing.
 - `BigStitcher/README_BigStitcher_DEF_exact.md`: optional container construction.
@@ -32,7 +33,7 @@ This catalog documents the role of **every existing script** in the repository. 
 - `ROIFiltering/Intensity/README_ROI_intensity_report.md`: intensity distribution and metrics.
 - `ROIFiltering/Area/README_ROI_area_report.md`, `ROIFiltering/Circularity/README_ROI_circularity_report.md`, `ROIFiltering/Eccentricity/README_ROI_eccentricity_report.md`, `ROIFiltering/Solidity/README_ROI_solidity_report.md`: shape diagnostics.
 - `ROIFiltering/FinalFilter/README_ROI_final_metric_filtering.md`: two-pass filter settings.
-- `Colocalization/README_01_run_colocalization.md`, `Colocalization/README_02_generate_colocalization_visualizations_updated.md`: stable matching, HDF5 contracts, and visualizations.
+- `Colocalization/README_01_run_colocalization.md`, `Colocalization/README_02_generate_colocalization_visualizations_updated.md`, `Colocalization/README_03_nucleus_constrained_matching.md`: stable matching, HDF5 contracts, visualizations, and Stage-09 provenance/variant comparisons.
 
 ## Intentional boundaries
 

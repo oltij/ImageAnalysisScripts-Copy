@@ -48,6 +48,7 @@ Important configuration fields:
 | `alignment.extra_args` | Optional CASTalign tuning flags; runner-managed paths/calibration cannot be overridden |
 | `pairs` | Ordered marker pairs; A-inside-B overlap is directional |
 | `thresholds` | Explicit overlap fractions in `[0, 1]` |
+| `nucleus_constrained_marker_matching` | Run the additional independent same-canonical-nucleus Stage 09 for every pair; defaults to `true` |
 | `filters.intensity/shape` | Existing percentile rules; percentile `0` disables that metric |
 | `reports` | Enable or disable organoid-mask, intensity, shape, and colocalization QC outputs |
 
@@ -90,11 +91,12 @@ stitched per-channel TIFFs
   -> intensity QC, then intensity-only filtering
   -> shape QC on intensity survivors, then shape-only filtering
   -> each marker matched to nuclear ROIs
-  -> nuclear-associated marker populations compared pairwise
-  -> colocalization QC and all-nuclear-cell summaries
+  -> nuclear-associated marker populations compared pairwise (original Stage 08)
+  -> the same pairs independently rematched after same-nucleus candidate restriction (Stage 09)
+  -> separate QC, direct variant comparisons, and Stage-07-derived all-nuclear-cell summaries
 ```
 
-The final coordinate-frame segmentation—not the initial registration segmentation—is used downstream. Shape filtering consumes the intensity-filtered pixels. Marker/nuclear HDF5 files preserve the canonical nuclear `ObjectID` mapping needed by the final all-cell summary; pairwise `CellID` values remain local to an individual colocalization run.
+The final coordinate-frame segmentation—not the initial registration segmentation—is used downstream. Shape filtering consumes the intensity-filtered pixels. Marker/nuclear HDF5 files preserve the canonical nuclear `ObjectID` mapping needed by the final all-cell summary and Stage-09 constraint; pairwise `CellID` values remain local to an individual colocalization run. Stage 09 validates marker provenance by exact pixel coordinates and validates that both Stage-07 sources contain the same nuclear segmentation before restricting candidates. It reuses the existing threshold and stable-matching implementation after that restriction; it is not a post-filter of Stage 08.
 
 When `alignment.enabled` is `false`, the redundant initial segmentation pass is skipped. The one final-coordinate-frame CellProfiler pass is still performed.
 
@@ -116,9 +118,18 @@ generated_cellprofiler/         # derived final-marker pipeline
 06_final_shape_filtered/
 07_nuclear_colocalization/
 08_marker_colocalization/
+09_marker_colocalization_nucleus_constrained/
 run.log
 run_manifest.json
 ```
+
+Stage-09 pair directories contain the complete analysis HDF5, a
+`nuclear_constraint_pair_audit.csv`, the same visualization output types, and
+`comparison_to_unconstrained/` CSV/PDF/PNG summaries. Stage-08 and Stage-09
+resume labels are independent. See
+[`Colocalization/README_03_nucleus_constrained_matching.md`](Colocalization/README_03_nucleus_constrained_matching.md)
+for exact identifiers, failure policy, output columns, zero-match behavior,
+and reporter usage.
 
 `run.log` contains every command and its combined terminal output. `run_manifest.json` records stage completion and provenance fingerprints.
 
