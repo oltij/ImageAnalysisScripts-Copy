@@ -26,6 +26,10 @@ RUNNER_SPEC = importlib.util.spec_from_file_location(
 runner = importlib.util.module_from_spec(RUNNER_SPEC)
 assert RUNNER_SPEC.loader is not None
 RUNNER_SPEC.loader.exec_module(runner)
+COMPARE_SPEC = importlib.util.spec_from_file_location("matching_compare_test", COMPARE)
+compare_module = importlib.util.module_from_spec(COMPARE_SPEC)
+assert COMPARE_SPEC.loader is not None
+COMPARE_SPEC.loader.exec_module(compare_module)
 
 
 def _store_table(h5: h5py.File, name: str, frame: pd.DataFrame) -> None:
@@ -151,6 +155,14 @@ def _run_analysis(
         "PIXEL_SIZE_X_UM": "0.5",
         "PIXEL_SIZE_Y_UM": "0.5",
     }
+    if a_stage07 is not None and b_stage07 is not None:
+        replacements.update(
+            {
+                "PAIR_IDENTITY_PROVENANCE": "True",
+                "OBJECT_A_NUCLEAR_RESULTS_FILE": runner.path_value(a_stage07),
+                "OBJECT_B_NUCLEAR_RESULTS_FILE": runner.path_value(b_stage07),
+            }
+        )
     if constrained:
         replacements.update(
             {
@@ -234,7 +246,10 @@ def _pair_set(frame: pd.DataFrame) -> set[tuple[int, int]]:
 
 def test_stage09_restricts_before_matching_and_records_provenance(tmp_path: Path):
     paths = _prepare_fixture(tmp_path)
-    stage08, _, run08 = _run_analysis(tmp_path, "stage08", **paths_without_sources(paths), constrained=False)
+    stage08, _, run08 = _run_analysis(
+        tmp_path, "stage08", **paths_without_sources(paths), constrained=False,
+        a_stage07=paths["a_stage07"], b_stage07=paths["b_stage07"],
+    )
     assert run08.returncode == 0, run08.stdout + run08.stderr
     before_hash = hashlib.sha256(stage08.read_bytes()).hexdigest()
 
@@ -260,14 +275,31 @@ def test_stage09_restricts_before_matching_and_records_provenance(tmp_path: Path
 
     with h5py.File(stage08, "r") as h5:
         stage08_meta = json.loads(h5["metadata/json"][()].decode("utf-8"))
-        assert "analysis_variant" not in stage08_meta
+        assert stage08_meta["analysis_variant"] == "stage08_unconstrained_marker_marker"
         assert "tables/nuclear_constraint_audit" not in h5
+        assert "tables/pair_id_mapping" in h5
     with h5py.File(stage09, "r") as h5:
         stage09_meta = json.loads(h5["metadata/json"][()].decode("utf-8"))
         assert stage09_meta["analysis_variant"] == "nucleus_constrained_marker_marker"
         assert stage09_meta["nuclear_identity_constraint"]["applied_before_preference_lists"]
         assert Path(stage09_meta["nuclear_identity_constraint"]["object_a_stage07_results_file"]) == paths["a_stage07"]
         assert "tables/nuclear_assignments_object_a" in h5
+        assert "tables/pair_id_mapping" in h5
+
+    stage08_pairs = _read_table(stage08, "pair_id_mapping")
+    stage09_pairs = _read_table(stage09, "pair_id_mapping")
+    assert stage08_pairs.PairID.tolist() == [
+        "S08_LHX6_PV_P000001", "S08_LHX6_PV_P000002", "S08_LHX6_PV_P000003"
+    ]
+    assert stage09_pairs.PairID.tolist() == [
+        "S09_LHX6_PV_P000001", "S09_LHX6_PV_P000002"
+    ]
+    assert stage08_pairs.Same_Nucleus.tolist() == ["NO", "UNRESOLVED", "UNRESOLVED"]
+    assert stage09_pairs.Same_Nucleus.tolist() == ["YES", "YES"]
+    assert (tmp_path / "stage08" / "stage08_final_pair_nuclear_identity.csv").is_file()
+    stage08_summary = pd.read_csv(tmp_path / "stage08" / "stage08_shared_nuclei_summary.csv").iloc[0]
+    assert int(stage08_summary.Different_Nucleus_Count) == 1
+    assert int(stage08_summary.Unresolved_Nucleus_Count) == 2
 
     audit = pd.read_csv(audit_csv).set_index(["A_ObjectID", "B_ObjectID"])
     same = audit.loc[(101, 201)]
@@ -297,13 +329,17 @@ def test_stage09_restricts_before_matching_and_records_provenance(tmp_path: Path
     for filename in (
         "matching_variant_comparison.csv", "matching_variant_pair_details.csv",
         "discordant_unconstrained_final_pairs.csv", "matching_variant_comparison.pdf",
-        "matching_variant_comparison.png",
+        "matching_variant_comparison.png", "pair_id_crosswalk_stage08_vs_stage09.csv",
     ):
         assert (comparison_dir / filename).is_file()
         assert (comparison_dir / filename).stat().st_size > 0
     details = pd.read_csv(comparison_dir / "matching_variant_pair_details.csv")
     discordant = details[details["Nuclear_Identity_Discordant"]]
     assert _pair_set(discordant) == {(101, 202)}
+    crosswalk = pd.read_csv(comparison_dir / "pair_id_crosswalk_stage08_vs_stage09.csv")
+    assert set(crosswalk.Tracking_Category) == {"stage08_only", "stage09_only", "unresolved_identity"}
+    assert "S08_LHX6_PV_P000001" in set(crosswalk.Stage08_PairID.dropna())
+    assert "S09_LHX6_PV_P000001" in set(crosswalk.Stage09_PairID.dropna())
 
 
 def paths_without_sources(paths: dict) -> dict:
@@ -322,6 +358,11 @@ def test_zero_eligible_constrained_result_is_valid(tmp_path: Path):
     b = pd.read_csv(paths["b_csv"])
     a[a["ROI"] == 103].to_csv(paths["a_csv"], index=False)
     b[b["ROI"] == 203].to_csv(paths["b_csv"], index=False)
+    stage08, _, stage08_completed = _run_analysis(
+        tmp_path, "stage08_zero", **paths_without_sources(paths), constrained=False,
+        a_stage07=paths["a_stage07"], b_stage07=paths["b_stage07"],
+    )
+    assert stage08_completed.returncode == 0, stage08_completed.stdout + stage08_completed.stderr
     stage09, audit_csv, completed = _run_analysis(
         tmp_path, "stage09_zero", **paths_without_sources(paths), constrained=True,
         a_stage07=paths["a_stage07"], b_stage07=paths["b_stage07"],
@@ -341,6 +382,14 @@ def test_zero_eligible_constrained_result_is_valid(tmp_path: Path):
         / "LHX6_PV_all_nuclear_cells_classification.csv"
     )
     assert all_nuclei.stat().st_size > 0
+    comparison = subprocess.run(
+        [sys.executable, str(COMPARE), "--unconstrained-h5", str(stage08),
+         "--constrained-h5", str(stage09), "--output-dir", str(tmp_path / "zero_comparison")],
+        text=True, capture_output=True, check=False,
+    )
+    assert comparison.returncode == 0, comparison.stdout + comparison.stderr
+    empty_crosswalk = pd.read_csv(tmp_path / "zero_comparison" / "pair_id_crosswalk_stage08_vs_stage09.csv")
+    assert empty_crosswalk.empty
 
 
 def test_incompatible_stage07_nuclear_segmentation_fails_safely(tmp_path: Path):
@@ -353,3 +402,61 @@ def test_incompatible_stage07_nuclear_segmentation_fails_safely(tmp_path: Path):
     assert "same canonical nuclear segmentation" in (completed.stdout + completed.stderr)
     assert not stage09.exists()
     assert audit_csv is not None and not audit_csv.exists()
+
+
+def test_pair_crosswalk_links_common_and_variant_only_pairs():
+    object_a = pd.DataFrame(_pixels(1, [(1, 1)]) + _pixels(2, [(2, 1)]) + _pixels(3, [(3, 1)]))
+    object_b = pd.DataFrame(_pixels(10, [(1, 1)]) + _pixels(20, [(2, 1)]) + _pixels(30, [(3, 1)]))
+    overlaps = pd.DataFrame([
+        {"A_ObjectID": 1, "B_ObjectID": 10},
+        {"A_ObjectID": 2, "B_ObjectID": 20},
+        {"A_ObjectID": 3, "B_ObjectID": 30},
+    ])
+    audit = pd.DataFrame([
+        {"A_ObjectID": a, "B_ObjectID": b,
+         "A_Stage07_Source_CellID": a + 100, "B_Stage07_Source_CellID": b + 100,
+         "A_Canonical_Nuclear_ObjectID": n, "B_Canonical_Nuclear_ObjectID": n,
+         "A_Mapping_Status": "resolved", "B_Mapping_Status": "resolved",
+         "Original_Overlap_Threshold_Pass": True,
+         "Final_Constrained_Eligibility": True,
+         "Final_Constrained_Stable_Match": (a, b) in {(1, 10), (3, 30)},
+         "Exclusion_Reason": ""}
+        for a, b, n in ((1, 10, 501), (2, 20, 502), (3, 30, 503))
+    ])
+    def pair_map(stage, pairs):
+        return pd.DataFrame([
+            {"PairID": f"S{stage:02d}_LHX6_PV_P{i:06d}",
+             "A_ObjectID": a, "B_ObjectID": b,
+             "A_Stage07_Source_CellID": a + 100, "B_Stage07_Source_CellID": b + 100,
+             "A_Canonical_Nuclear_ObjectID": n, "B_Canonical_Nuclear_ObjectID": n,
+             "Same_Nucleus": "YES"}
+            for i, (a, b, n) in enumerate(pairs, 1)
+        ])
+    base_meta = {
+        "objects": {"object_a_name": "LHX6", "object_b_name": "PV"},
+        "matching": {"threshold": 0.5},
+    }
+    stage08_pairs = [(1, 10, 501), (2, 20, 502)]
+    stage09_pairs = [(1, 10, 501), (3, 30, 503)]
+    unconstrained = {
+        "metadata": base_meta, "object_a": object_a, "object_b": object_b,
+        "overlap": overlaps, "eligible": overlaps,
+        "matching": pd.DataFrame([(a, b) for a, b, _ in stage08_pairs], columns=["A_ObjectID", "B_ObjectID"]),
+        "pair_mapping": pair_map(8, stage08_pairs),
+    }
+    constrained = {
+        "metadata": {**base_meta, "analysis_variant": "nucleus_constrained_marker_marker"},
+        "object_a": object_a, "object_b": object_b,
+        "overlap": overlaps, "eligible": overlaps,
+        "matching": pd.DataFrame([(a, b) for a, b, _ in stage09_pairs], columns=["A_ObjectID", "B_ObjectID"]),
+        "pair_mapping": pair_map(9, stage09_pairs), "audit": audit,
+    }
+    summary, _, _, crosswalk = compare_module.build_comparison(unconstrained, constrained)
+    categories = dict(zip(zip(crosswalk.A_ObjectID, crosswalk.B_ObjectID), crosswalk.Tracking_Category))
+    assert categories[(1, 10)] == "common_to_both"
+    assert categories[(2, 20)] == "stage08_only"
+    assert categories[(3, 30)] == "stage09_only"
+    common = crosswalk[(crosswalk.A_ObjectID == 1) & (crosswalk.B_ObjectID == 10)].iloc[0]
+    assert common.Stage08_PairID == "S08_LHX6_PV_P000001"
+    assert common.Stage09_PairID == "S09_LHX6_PV_P000001"
+    assert summary.Metric.str.contains("Unique shared nuclei represented in Stage 09").any()

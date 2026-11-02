@@ -909,6 +909,20 @@ def run(cfg: dict, resume: bool) -> None:
             "PIXEL_SIZE_X_UM": repr(x), "PIXEL_SIZE_Y_UM": repr(y),
         }
         expected = [h5path]
+        if nuclear_sources:
+            pair_stage = 9 if constraint_sources else 8
+            pair_mapping_csv = directory / "pair_id_mapping.csv"
+            pair_identity_csv = directory / f"stage{pair_stage:02d}_final_pair_nuclear_identity.csv"
+            pair_summary_csv = directory / f"stage{pair_stage:02d}_shared_nuclei_summary.csv"
+            settings.update({
+                "PAIR_IDENTITY_PROVENANCE": "True",
+                "OBJECT_A_NUCLEAR_RESULTS_FILE": path_value(nuclear_sources[0]),
+                "OBJECT_B_NUCLEAR_RESULTS_FILE": path_value(nuclear_sources[1]),
+                "PAIR_ID_MAPPING_CSV": path_value(pair_mapping_csv),
+                "PAIR_NUCLEAR_IDENTITY_CSV": path_value(pair_identity_csv),
+                "PAIR_NUCLEAR_SUMMARY_CSV": path_value(pair_summary_csv),
+            })
+            expected.extend([pair_mapping_csv, pair_identity_csv, pair_summary_csv])
         if constraint_sources:
             if constraint_audit_csv is None:
                 raise ValueError("A constrained colocalization requires an audit CSV path")
@@ -989,6 +1003,7 @@ def run(cfg: dict, resume: bool) -> None:
                     comparison / "matching_variant_comparison.csv",
                     comparison / "matching_variant_pair_details.csv",
                     comparison / "discordant_unconstrained_final_pairs.csv",
+                    comparison / "pair_id_crosswalk_stage08_vs_stage09.csv",
                     comparison / "matching_variant_comparison.pdf",
                     comparison / "matching_variant_comparison.png",
                 ],

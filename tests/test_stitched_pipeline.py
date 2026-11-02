@@ -540,8 +540,11 @@ class StitchedPipelineTests(unittest.TestCase):
             marker_pair = calls_by_label["08_pair_LHX6_PV"]
             self.assertIn("LHX6_nuclear_positive_cells.csv", marker_pair[3]["OBJECT_A_CSV"])
             self.assertIn("PV_nuclear_positive_cells.csv", marker_pair[3]["OBJECT_B_CSV"])
+            self.assertEqual(marker_pair[3]["PAIR_IDENTITY_PROVENANCE"], "True")
+            self.assertIn("stage08_final_pair_nuclear_identity.csv", " ".join(str(p) for p in marker_pair[4]))
             constrained_pair = calls_by_label["09_nucleus_constrained_pair_LHX6_PV"]
             self.assertEqual(constrained_pair[3]["NUCLEAR_IDENTITY_CONSTRAINT"], "True")
+            self.assertEqual(constrained_pair[3]["PAIR_IDENTITY_PROVENANCE"], "True")
             self.assertIn("07_nuclear_colocalization/LHX6_vs_DNA/analysis.h5", constrained_pair[3]["OBJECT_A_NUCLEAR_RESULTS_FILE"])
             self.assertIn("07_nuclear_colocalization/PV_vs_DNA/analysis.h5", constrained_pair[3]["OBJECT_B_NUCLEAR_RESULTS_FILE"])
             self.assertIn("09_marker_colocalization_nucleus_constrained", constrained_pair[3]["RESULTS_FILE"])
@@ -551,6 +554,7 @@ class StitchedPipelineTests(unittest.TestCase):
             comparison_command = " ".join(comparison[2])
             self.assertIn("08_marker_colocalization", comparison_command)
             self.assertIn("09_marker_colocalization_nucleus_constrained", comparison_command)
+            self.assertIn("pair_id_crosswalk_stage08_vs_stage09.csv", " ".join(str(p) for p in comparison[3]))
 
 
 if __name__ == "__main__":

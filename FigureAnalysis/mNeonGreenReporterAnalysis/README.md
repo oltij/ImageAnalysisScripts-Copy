@@ -22,6 +22,11 @@ does not modify either Great Lakes workspace.
   the six Experiment 17 ventral blocks.
 - `.gitignore`: excludes generated figures/tables and large microscopy data
   from this source directory.
+- `build_per_organoid_reports.py`: per-field QC reports with Stage-07 CellID
+  provenance and separate Stage-08/Stage-09 PairID quartile sections; see
+  `README_per_organoid_reports.md`.
+- `query_cell_id.py`: read-only field query by Stage-07 CellID, canonical
+  nuclear ObjectID, or Stage-08/09 PairID; see `README_QUERY_CELL_ID.md`.
 
 The mapping CSV is resolved relative to the script by default. Scratch
 workspaces, the verified H1 selection, and the output directory remain

@@ -7,6 +7,7 @@ import argparse
 import io
 import json
 from pathlib import Path
+import re
 
 import h5py
 import matplotlib
@@ -35,6 +36,8 @@ def load_analysis(path: Path) -> dict:
         }
         if "tables/nuclear_constraint_audit" in h5:
             result["audit"] = read_table(h5, "nuclear_constraint_audit")
+        if "tables/pair_id_mapping" in h5:
+            result["pair_mapping"] = read_table(h5, "pair_id_mapping")
     return result
 
 
@@ -71,6 +74,70 @@ def pair_keys(frame: pd.DataFrame) -> set[tuple[int, int]]:
             pd.to_numeric(frame["B_ObjectID"], errors="raise").astype(int),
         )
     )
+
+
+def pair_mapping_for_analysis(analysis: dict, stage: int, audit: pd.DataFrame) -> pd.DataFrame:
+    """Load or deterministically reconstruct final-pair provenance.
+
+    Reconstruction keeps the comparison tool readable for successful legacy
+    HDF5 files created before ``pair_id_mapping`` was added.
+    """
+    matches = analysis["matching"].sort_values(
+        ["A_ObjectID", "B_ObjectID"], kind="mergesort"
+    ).reset_index(drop=True)
+    supplied = analysis.get("pair_mapping")
+    names = analysis["metadata"]["objects"]
+    token = lambda value: re.sub(r"[^A-Za-z0-9]+", "_", str(value)).strip("_")
+    prefix = f"S{stage:02d}_{token(names['object_a_name'])}_{token(names['object_b_name'])}"
+    audit_lookup = audit.set_index(["A_ObjectID", "B_ObjectID"], drop=False)
+    rows = []
+    for sequence, match in enumerate(matches.itertuples(index=False), 1):
+        key = (int(match.A_ObjectID), int(match.B_ObjectID))
+        if key not in audit_lookup.index:
+            raise ValueError(f"Final pair {key} is absent from the nuclear identity audit")
+        row = audit_lookup.loc[key]
+        if isinstance(row, pd.DataFrame):
+            raise ValueError(f"Duplicate nuclear identity audit row for pair {key}")
+        a_status, b_status = str(row["A_Mapping_Status"]), str(row["B_Mapping_Status"])
+        if a_status == "resolved" and b_status == "resolved":
+            same = (
+                "YES" if int(row["A_Canonical_Nuclear_ObjectID"])
+                == int(row["B_Canonical_Nuclear_ObjectID"]) else "NO"
+            )
+        else:
+            same = "UNRESOLVED"
+        rows.append({
+            "PairID": f"{prefix}_P{sequence:06d}",
+            "A_ObjectID": key[0],
+            "B_ObjectID": key[1],
+            "A_Stage07_Source_CellID": row["A_Stage07_Source_CellID"],
+            "B_Stage07_Source_CellID": row["B_Stage07_Source_CellID"],
+            "A_Canonical_Nuclear_ObjectID": row["A_Canonical_Nuclear_ObjectID"],
+            "B_Canonical_Nuclear_ObjectID": row["B_Canonical_Nuclear_ObjectID"],
+            "A_Mapping_Status": a_status,
+            "B_Mapping_Status": b_status,
+            "Same_Nucleus": same,
+        })
+    reconstructed = pd.DataFrame(rows, columns=[
+        "PairID", "A_ObjectID", "B_ObjectID",
+        "A_Stage07_Source_CellID", "B_Stage07_Source_CellID",
+        "A_Canonical_Nuclear_ObjectID", "B_Canonical_Nuclear_ObjectID",
+        "A_Mapping_Status", "B_Mapping_Status", "Same_Nucleus",
+    ])
+    if supplied is None:
+        return reconstructed
+    required = {"PairID", "A_ObjectID", "B_ObjectID", "Same_Nucleus"}
+    missing = required - set(supplied.columns)
+    if missing:
+        raise ValueError(f"pair_id_mapping missing {sorted(missing)}")
+    if pair_keys(supplied) != pair_keys(matches):
+        raise ValueError("pair_id_mapping does not contain exactly the final stable matches")
+    supplied = supplied.copy()
+    expected_ids = reconstructed.set_index(["A_ObjectID", "B_ObjectID"])["PairID"]
+    actual_ids = supplied.set_index(["A_ObjectID", "B_ObjectID"])["PairID"]
+    if not actual_ids.sort_index().equals(expected_ids.sort_index()):
+        raise ValueError("pair_id_mapping PairIDs are not deterministic for sorted final pairs")
+    return supplied
 
 
 def build_comparison(unconstrained: dict, constrained: dict):
@@ -122,12 +189,16 @@ def build_comparison(unconstrained: dict, constrained: dict):
     different_nuclei = spatial_pass & resolved & ~same_nucleus
     unresolved = spatial_pass & ~resolved
 
-    unconstrained_final = pair_keys(unconstrained["matching"])
-    constrained_final = pair_keys(constrained["matching"])
+    unconstrained_mapping = pair_mapping_for_analysis(unconstrained, 8, audit)
+    constrained_mapping = pair_mapping_for_analysis(constrained, 9, audit)
+    unconstrained_final = pair_keys(unconstrained_mapping)
+    constrained_final = pair_keys(constrained_mapping)
     common = unconstrained_final & constrained_final
     only_unconstrained = unconstrained_final - constrained_final
     only_constrained = constrained_final - unconstrained_final
     audit_lookup = audit.set_index(["A_ObjectID", "B_ObjectID"], drop=False)
+    stage08_lookup = unconstrained_mapping.set_index(["A_ObjectID", "B_ObjectID"], drop=False)
+    stage09_lookup = constrained_mapping.set_index(["A_ObjectID", "B_ObjectID"], drop=False)
 
     pair_rows = []
     for a_id, b_id in sorted(unconstrained_final | constrained_final):
@@ -141,6 +212,12 @@ def build_comparison(unconstrained: dict, constrained: dict):
         in_constrained = (a_id, b_id) in constrained_final
         record["Unconstrained_Final_Stable_Match"] = in_unconstrained
         record["Constrained_Final_Stable_Match"] = in_constrained
+        record["Stage08_PairID"] = (
+            stage08_lookup.loc[(a_id, b_id), "PairID"] if in_unconstrained else pd.NA
+        )
+        record["Stage09_PairID"] = (
+            stage09_lookup.loc[(a_id, b_id), "PairID"] if in_constrained else pd.NA
+        )
         record["Pair_Category"] = (
             "common" if in_unconstrained and in_constrained
             else "unconstrained_only" if in_unconstrained
@@ -156,6 +233,8 @@ def build_comparison(unconstrained: dict, constrained: dict):
     pair_detail_columns = list(audit.columns) + [
         "Unconstrained_Final_Stable_Match",
         "Constrained_Final_Stable_Match",
+        "Stage08_PairID",
+        "Stage09_PairID",
         "Pair_Category",
         "Nuclear_Identity_Discordant",
     ]
@@ -175,6 +254,22 @@ def build_comparison(unconstrained: dict, constrained: dict):
         if unconstrained_final else 0.0
     )
 
+    stage08_same = int(unconstrained_mapping["Same_Nucleus"].eq("YES").sum())
+    stage08_different = int(unconstrained_mapping["Same_Nucleus"].eq("NO").sum())
+    stage08_unresolved = int(unconstrained_mapping["Same_Nucleus"].eq("UNRESOLVED").sum())
+    stage08_unique_nuclei = int(pd.to_numeric(
+        unconstrained_mapping.loc[
+            unconstrained_mapping["Same_Nucleus"].eq("YES"),
+            "A_Canonical_Nuclear_ObjectID",
+        ], errors="coerce"
+    ).dropna().nunique())
+    stage09_unique_nuclei = int(pd.to_numeric(
+        constrained_mapping.loc[
+            constrained_mapping["Same_Nucleus"].eq("YES"),
+            "A_Canonical_Nuclear_ObjectID",
+        ], errors="coerce"
+    ).dropna().nunique())
+
     metrics = [
         ("Marker A input ROIs", unconstrained["object_a"]["ObjectID"].nunique(), "ROIs"),
         ("Marker B input ROIs", unconstrained["object_b"]["ObjectID"].nunique(), "ROIs"),
@@ -185,6 +280,11 @@ def build_comparison(unconstrained: dict, constrained: dict):
         ("Pairs passing overlap and nuclear constraints", int(constrained_eligible.sum()), "pairs"),
         ("Final unconstrained stable matches", len(unconstrained_final), "pairs"),
         ("Final nucleus-constrained stable matches", len(constrained_final), "pairs"),
+        ("Stage-08 final pairs with same-nucleus identity", stage08_same, "pairs"),
+        ("Stage-08 final pairs with different-nucleus identity", stage08_different, "pairs"),
+        ("Stage-08 final pairs with unresolved nuclear identity", stage08_unresolved, "pairs"),
+        ("Unique shared nuclei represented in Stage 08", stage08_unique_nuclei, "nuclei"),
+        ("Unique shared nuclei represented in Stage 09", stage09_unique_nuclei, "nuclei"),
         ("Common final pairs", len(common), "pairs"),
         ("Final pairs unique to unconstrained", len(only_unconstrained), "pairs"),
         ("Final pairs unique to nucleus-constrained", len(only_constrained), "pairs"),
@@ -192,7 +292,65 @@ def build_comparison(unconstrained: dict, constrained: dict):
         ("Percent unconstrained final pairs with discordant nuclear identity", discordant_percent, "percent"),
     ]
     summary = pd.DataFrame(metrics, columns=["Metric", "Value", "Units"])
-    return summary, pair_details, discordant_unconstrained
+    crosswalk_rows = []
+    for a_id, b_id in sorted(unconstrained_final | constrained_final):
+        present08 = (a_id, b_id) in unconstrained_final
+        present09 = (a_id, b_id) in constrained_final
+        if present08 and present09:
+            left = stage08_lookup.loc[(a_id, b_id)]
+            right = stage09_lookup.loc[(a_id, b_id)]
+            for column in (
+                "A_Stage07_Source_CellID", "B_Stage07_Source_CellID",
+                "A_Canonical_Nuclear_ObjectID", "B_Canonical_Nuclear_ObjectID",
+                "Same_Nucleus",
+            ):
+                left_value, right_value = left.get(column, pd.NA), right.get(column, pd.NA)
+                if pd.isna(left_value) and pd.isna(right_value):
+                    continue
+                equal = (
+                    str(left_value) == str(right_value)
+                    if column == "Same_Nucleus"
+                    else pd.notna(left_value) and pd.notna(right_value)
+                    and float(left_value) == float(right_value)
+                )
+                if not equal:
+                    raise ValueError(
+                        f"Cross-variant provenance mismatch for pair {(a_id, b_id)} column {column}: "
+                        f"{left_value!r} vs {right_value!r}"
+                    )
+        source = stage08_lookup.loc[(a_id, b_id)] if present08 else stage09_lookup.loc[(a_id, b_id)]
+        same = str(source["Same_Nucleus"])
+        if same == "UNRESOLVED":
+            category = "unresolved_identity"
+        elif present08 and present09:
+            category = "common_to_both"
+        elif present08:
+            category = "stage08_only"
+        else:
+            category = "stage09_only"
+        crosswalk_rows.append({
+            "Stage08_PairID": stage08_lookup.loc[(a_id, b_id), "PairID"] if present08 else pd.NA,
+            "Stage09_PairID": stage09_lookup.loc[(a_id, b_id), "PairID"] if present09 else pd.NA,
+            "A_ObjectID": a_id,
+            "B_ObjectID": b_id,
+            "Present_In_Stage08": present08,
+            "Present_In_Stage09": present09,
+            "Matched_In_Both": present08 and present09,
+            "A_Stage07_Source_CellID": source.get("A_Stage07_Source_CellID", pd.NA),
+            "B_Stage07_Source_CellID": source.get("B_Stage07_Source_CellID", pd.NA),
+            "A_Canonical_Nuclear_ObjectID": source.get("A_Canonical_Nuclear_ObjectID", pd.NA),
+            "B_Canonical_Nuclear_ObjectID": source.get("B_Canonical_Nuclear_ObjectID", pd.NA),
+            "Same_Nucleus": same,
+            "Tracking_Category": category,
+        })
+    crosswalk = pd.DataFrame(crosswalk_rows, columns=[
+        "Stage08_PairID", "Stage09_PairID", "A_ObjectID", "B_ObjectID",
+        "Present_In_Stage08", "Present_In_Stage09", "Matched_In_Both",
+        "A_Stage07_Source_CellID", "B_Stage07_Source_CellID",
+        "A_Canonical_Nuclear_ObjectID", "B_Canonical_Nuclear_ObjectID",
+        "Same_Nucleus", "Tracking_Category",
+    ])
+    return summary, pair_details, discordant_unconstrained, crosswalk
 
 
 def save_figure(summary: pd.DataFrame, object_a: str, object_b: str, pdf_path: Path, png_path: Path):
@@ -235,12 +393,13 @@ def main(argv: list[str] | None = None) -> int:
 
     unconstrained = load_analysis(args.unconstrained_h5)
     constrained = load_analysis(args.constrained_h5)
-    summary, details, discordant = build_comparison(unconstrained, constrained)
+    summary, details, discordant, crosswalk = build_comparison(unconstrained, constrained)
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
     summary.to_csv(output / "matching_variant_comparison.csv", index=False)
     details.to_csv(output / "matching_variant_pair_details.csv", index=False)
     discordant.to_csv(output / "discordant_unconstrained_final_pairs.csv", index=False)
+    crosswalk.to_csv(output / "pair_id_crosswalk_stage08_vs_stage09.csv", index=False)
     names = unconstrained["metadata"]["objects"]
     save_figure(
         summary,

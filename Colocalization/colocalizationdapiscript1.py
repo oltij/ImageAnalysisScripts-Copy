@@ -30,6 +30,7 @@ from pathlib import Path
 from datetime import datetime
 import io
 import json
+import re
 
 import h5py
 import numpy as np
@@ -83,6 +84,14 @@ NUCLEAR_IDENTITY_CONSTRAINT = False
 OBJECT_A_NUCLEAR_RESULTS_FILE = None
 OBJECT_B_NUCLEAR_RESULTS_FILE = None
 NUCLEAR_CONSTRAINT_AUDIT_CSV = None
+
+# Optional provenance export for marker-marker runs. This resolves the final
+# pair members back to the authoritative Stage-07 marker CellIDs and canonical
+# nuclear ObjectIDs, but does not alter overlap eligibility or stable matching.
+PAIR_IDENTITY_PROVENANCE = False
+PAIR_ID_MAPPING_CSV = None
+PAIR_NUCLEAR_IDENTITY_CSV = None
+PAIR_NUCLEAR_SUMMARY_CSV = None
 
 
 # ============================================================
@@ -376,6 +385,155 @@ def validate_nuclear_contexts(context_a: dict, context_b: dict):
         )
 
 
+def pair_id_token(value: str) -> str:
+    """Return a stable, filename-safe marker token without changing identity."""
+    token = re.sub(r"[^A-Za-z0-9]+", "_", str(value)).strip("_")
+    if not token:
+        raise ValueError(f"Cannot create a pair ID token from {value!r}")
+    return token
+
+
+def build_pair_identity_mapping(
+    matching: pd.DataFrame,
+    overlaps: pd.DataFrame,
+    context_a: dict,
+    context_b: dict,
+    *,
+    stage: int,
+) -> pd.DataFrame:
+    """Attach deterministic PairIDs and Stage-07 provenance to final pairs.
+
+    The input ``matching`` table is never changed. Pair numbering is assigned
+    only after matching, in deterministic (A_ObjectID, B_ObjectID) order.
+    """
+    columns = [
+        "PairID", "Analysis_Variant", "Field_Analysis_Path",
+        "A_Marker", "B_Marker", "A_ObjectID", "B_ObjectID",
+        "A_Original_ROI_ObjectID", "B_Original_ROI_ObjectID",
+        "A_Stage07_Source_CellID", "B_Stage07_Source_CellID",
+        "A_Canonical_Nuclear_ObjectID", "B_Canonical_Nuclear_ObjectID",
+        "A_Mapping_Status", "B_Mapping_Status", "Same_Nucleus",
+        "Shared_Area", "A_Percent_Inside_B", "B_Percent_Inside_A",
+        "Stage_Local_Pairwise_CellID", "Final_Stable_Match",
+        "A_Stage07_Results_File", "B_Stage07_Results_File",
+    ]
+    if stage not in (8, 9):
+        raise ValueError(f"Pair identity provenance requires Stage 08 or 09, got {stage}")
+    if matching.empty:
+        return pd.DataFrame(columns=columns)
+
+    a_assignments = context_a["assignments"].set_index("Current_ObjectID", drop=False)
+    b_assignments = context_b["assignments"].set_index("Current_ObjectID", drop=False)
+    if a_assignments.index.duplicated().any() or b_assignments.index.duplicated().any():
+        raise ValueError("Current marker ObjectIDs are not unique in Stage-07 provenance")
+    overlap_lookup = overlaps.set_index(["A_ObjectID", "B_ObjectID"], drop=False)
+    if overlap_lookup.index.duplicated().any():
+        raise ValueError("Overlap table contains duplicate A/B object pairs")
+    pairwise_cell = {
+        (int(row.A_ObjectID), int(row.B_ObjectID)): int(row.CellID)
+        for row in cell_id_mapping.itertuples(index=False)
+    }
+    prefix = f"S{stage:02d}_{pair_id_token(OBJECT_A_NAME)}_{pair_id_token(OBJECT_B_NAME)}"
+    variant = "stage08_unconstrained" if stage == 8 else "stage09_nucleus_constrained"
+    rows = []
+    ordered = matching.sort_values(["A_ObjectID", "B_ObjectID"], kind="mergesort")
+    for sequence, match in enumerate(ordered.itertuples(index=False), 1):
+        a_id, b_id = int(match.A_ObjectID), int(match.B_ObjectID)
+        if a_id not in a_assignments.index or b_id not in b_assignments.index:
+            raise ValueError(f"Final pair {(a_id, b_id)} is missing Stage-07 provenance")
+        a_row = a_assignments.loc[a_id]
+        b_row = b_assignments.loc[b_id]
+        a_status = str(a_row["Mapping_Status"])
+        b_status = str(b_row["Mapping_Status"])
+        if a_status == "resolved" and b_status == "resolved":
+            a_nucleus = int(a_row["Canonical_Nuclear_ObjectID"])
+            b_nucleus = int(b_row["Canonical_Nuclear_ObjectID"])
+            same = "YES" if a_nucleus == b_nucleus else "NO"
+        else:
+            a_nucleus = None if a_status != "resolved" else int(a_row["Canonical_Nuclear_ObjectID"])
+            b_nucleus = None if b_status != "resolved" else int(b_row["Canonical_Nuclear_ObjectID"])
+            same = "UNRESOLVED"
+        if (a_id, b_id) not in overlap_lookup.index:
+            raise ValueError(f"Final pair {(a_id, b_id)} is absent from overlap results")
+        overlap = overlap_lookup.loc[(a_id, b_id)]
+        rows.append({
+            "PairID": f"{prefix}_P{sequence:06d}",
+            "Analysis_Variant": variant,
+            "Field_Analysis_Path": str(RESULTS_FILE.parent),
+            "A_Marker": OBJECT_A_NAME,
+            "B_Marker": OBJECT_B_NAME,
+            "A_ObjectID": a_id,
+            "B_ObjectID": b_id,
+            "A_Original_ROI_ObjectID": (
+                int(a_row["Stage07_Marker_ObjectID"]) if a_status == "resolved" else None
+            ),
+            "B_Original_ROI_ObjectID": (
+                int(b_row["Stage07_Marker_ObjectID"]) if b_status == "resolved" else None
+            ),
+            "A_Stage07_Source_CellID": (
+                int(a_row["Stage07_Source_CellID"]) if a_status == "resolved" else None
+            ),
+            "B_Stage07_Source_CellID": (
+                int(b_row["Stage07_Source_CellID"]) if b_status == "resolved" else None
+            ),
+            "A_Canonical_Nuclear_ObjectID": a_nucleus,
+            "B_Canonical_Nuclear_ObjectID": b_nucleus,
+            "A_Mapping_Status": a_status,
+            "B_Mapping_Status": b_status,
+            "Same_Nucleus": same,
+            "Shared_Area": int(overlap["Shared_Area"]),
+            "A_Percent_Inside_B": float(overlap["A_Percent_Inside_B"]),
+            "B_Percent_Inside_A": float(overlap["B_Percent_Inside_A"]),
+            "Stage_Local_Pairwise_CellID": pairwise_cell[(a_id, b_id)],
+            "Final_Stable_Match": True,
+            "A_Stage07_Results_File": str(context_a["results_file"]),
+            "B_Stage07_Results_File": str(context_b["results_file"]),
+        })
+    result = pd.DataFrame(rows, columns=columns)
+    if result["PairID"].duplicated().any():
+        raise ValueError("Generated PairIDs are not unique")
+    if stage == 9 and not result["Same_Nucleus"].eq("YES").all():
+        bad = result.loc[~result["Same_Nucleus"].eq("YES"), "PairID"].tolist()
+        raise ValueError(f"Stage-09 final pairs must all resolve to the same nucleus: {bad}")
+    return result
+
+
+def pair_identity_summary(pair_mapping: pd.DataFrame, *, stage: int) -> pd.DataFrame:
+    counts = pair_mapping["Same_Nucleus"].value_counts() if len(pair_mapping) else pd.Series(dtype=int)
+    total = int(len(pair_mapping))
+    same = int(counts.get("YES", 0))
+    different = int(counts.get("NO", 0))
+    unresolved = int(counts.get("UNRESOLVED", 0))
+    unique_nuclei = int(
+        pd.to_numeric(
+            pair_mapping.loc[pair_mapping["Same_Nucleus"].eq("YES"), "A_Canonical_Nuclear_ObjectID"],
+            errors="coerce",
+        ).dropna().nunique()
+    ) if len(pair_mapping) else 0
+    percent = lambda value: (100.0 * value / total) if total else 0.0
+    return pd.DataFrame([{
+        "Analysis_Variant": "stage08_unconstrained" if stage == 8 else "stage09_nucleus_constrained",
+        "A_Marker": OBJECT_A_NAME,
+        "B_Marker": OBJECT_B_NAME,
+        "Total_Final_Pairs": total,
+        "Same_Nucleus_Count": same,
+        "Different_Nucleus_Count": different,
+        "Unresolved_Nucleus_Count": unresolved,
+        "Same_Nucleus_Percent": percent(same),
+        "Different_Nucleus_Percent": percent(different),
+        "Unresolved_Nucleus_Percent": percent(unresolved),
+        "Unique_Shared_Nuclei": unique_nuclei,
+    }])
+
+
+def write_csv_atomic(frame: pd.DataFrame, destination: Path):
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    frame.to_csv(temporary, index=False)
+    temporary.replace(destination)
+
+
 def build_nuclear_constraint_audit(
     overlap_df: pd.DataFrame,
     assignments_a: pd.DataFrame,
@@ -484,7 +642,7 @@ constraint_context_a = None
 constraint_context_b = None
 constraint_audit_df = pd.DataFrame()
 
-if NUCLEAR_IDENTITY_CONSTRAINT:
+if NUCLEAR_IDENTITY_CONSTRAINT or PAIR_IDENTITY_PROVENANCE:
     print("\nResolving canonical nuclear identities from Stage-07 analyses...")
     constraint_context_a = load_nuclear_assignment_context(
         OBJECT_A_NUCLEAR_RESULTS_FILE,
@@ -938,6 +1096,29 @@ if len(matching_df) > 0:
     ]
 
 
+# Pair identity is a provenance layer over the completed matching result. It is
+# deliberately computed after stable matching so it cannot affect eligibility,
+# preferences, or the historical pairwise CellID assignment.
+pair_id_mapping = pd.DataFrame()
+pair_nuclear_summary = pd.DataFrame()
+pair_mapping_csv = None
+pair_identity_csv = None
+pair_summary_csv = None
+if PAIR_IDENTITY_PROVENANCE:
+    pair_stage = 9 if NUCLEAR_IDENTITY_CONSTRAINT else 8
+    pair_id_mapping = build_pair_identity_mapping(
+        matching_df,
+        overlap_df,
+        constraint_context_a,
+        constraint_context_b,
+        stage=pair_stage,
+    )
+    pair_nuclear_summary = pair_identity_summary(pair_id_mapping, stage=pair_stage)
+    pair_mapping_csv = Path(PAIR_ID_MAPPING_CSV) if PAIR_ID_MAPPING_CSV is not None else RESULTS_FILE.parent / "pair_id_mapping.csv"
+    pair_identity_csv = Path(PAIR_NUCLEAR_IDENTITY_CSV) if PAIR_NUCLEAR_IDENTITY_CSV is not None else RESULTS_FILE.parent / f"stage{pair_stage:02d}_final_pair_nuclear_identity.csv"
+    pair_summary_csv = Path(PAIR_NUCLEAR_SUMMARY_CSV) if PAIR_NUCLEAR_SUMMARY_CSV is not None else RESULTS_FILE.parent / f"stage{pair_stage:02d}_shared_nuclei_summary.csv"
+
+
 # ============================================================
 # FILTERED PIXEL TABLES
 # ============================================================
@@ -1270,7 +1451,7 @@ if a_original.shape != b_original.shape:
         f"{OBJECT_B_NAME}: {b_original.shape}"
     )
 
-if NUCLEAR_IDENTITY_CONSTRAINT:
+if NUCLEAR_IDENTITY_CONSTRAINT or PAIR_IDENTITY_PROVENANCE:
     if tuple(a_original.shape) != tuple(constraint_context_a["marker_image_shape"]):
         raise ValueError(
             f"Current {OBJECT_A_NAME} fluorescence canvas {a_original.shape} does not match "
@@ -1365,6 +1546,26 @@ if NUCLEAR_IDENTITY_CONSTRAINT:
         "canonical_nuclear_objectid": "Stage-07 nuclear Object B ObjectID; cross-marker identity anchor",
         "output_cellid": "run-local CellID assigned only to this constrained marker-marker result",
     }
+elif PAIR_IDENTITY_PROVENANCE:
+    metadata["analysis_variant"] = "stage08_unconstrained_marker_marker"
+    metadata["nuclear_identity_provenance"] = {
+        "enabled": True,
+        "affects_matching": False,
+        "canonical_identity": "Stage-07 nuclear Object B ObjectID",
+        "object_a_stage07_results_file": str(OBJECT_A_NUCLEAR_RESULTS_FILE),
+        "object_b_stage07_results_file": str(OBJECT_B_NUCLEAR_RESULTS_FILE),
+        "marker_identity_verified_by": (
+            "exact current-to-Stage-07 marker ROI pixel coordinates; ROI and CellID are provenance checks only"
+        ),
+    }
+
+if PAIR_IDENTITY_PROVENANCE:
+    metadata["pair_identifier"] = {
+        "table": "pair_id_mapping",
+        "deterministic_sort": ["A_ObjectID", "B_ObjectID"],
+        "format": "S08_<A>_<B>_P000001 or S09_<A>_<B>_P000001",
+        "scientific_matching_unchanged": True,
+    }
 
 print("\nWriting single analysis results file:")
 print(RESULTS_FILE)
@@ -1399,7 +1600,9 @@ with h5py.File(RESULTS_FILE, "w") as h5:
     store_dataframe(h5, "unmatched_object_a", unmatched_df)
     store_dataframe(h5, "summary_statistics", summary_df)
     store_dataframe(h5, "filtering_stage_counts", filtering_stage_df)
-    if NUCLEAR_IDENTITY_CONSTRAINT:
+    if PAIR_IDENTITY_PROVENANCE:
+        store_dataframe(h5, "pair_id_mapping", pair_id_mapping)
+        store_dataframe(h5, "pair_nuclear_identity_summary", pair_nuclear_summary)
         store_dataframe(
             h5,
             "nuclear_assignments_object_a",
@@ -1410,7 +1613,13 @@ with h5py.File(RESULTS_FILE, "w") as h5:
             "nuclear_assignments_object_b",
             constraint_context_b["assignments"],
         )
+    if NUCLEAR_IDENTITY_CONSTRAINT:
         store_dataframe(h5, "nuclear_constraint_audit", constraint_audit_df)
+
+if PAIR_IDENTITY_PROVENANCE:
+    write_csv_atomic(pair_id_mapping, pair_mapping_csv)
+    write_csv_atomic(pair_id_mapping, pair_identity_csv)
+    write_csv_atomic(pair_nuclear_summary, pair_summary_csv)
 
 
 # ============================================================
