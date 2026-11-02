@@ -356,7 +356,9 @@ The original Stage 08 remains under `analysis/08_marker_colocalization/`.
 Stage 09 is written separately under
 `analysis/09_marker_colocalization_nucleus_constrained/`, with coordinate-
 verified Stage-07 nuclear provenance, a pair audit, the same visualization
-workflow, and a direct variant comparison. Valid resume treats the two stages
+workflow, and a direct variant comparison. Both variants now export
+deterministic PairIDs, all-final-pair nuclear-identity CSVs, and an explicit
+Stage-08/Stage-09 pair crosswalk. Valid resume treats the two stages
 independently. The existing all-nuclei marker-coexpression summary is still
 derived from Stage 07 and is not a Stage-09 match count. See
 [`../Colocalization/README_03_nucleus_constrained_matching.md`](../Colocalization/README_03_nucleus_constrained_matching.md).

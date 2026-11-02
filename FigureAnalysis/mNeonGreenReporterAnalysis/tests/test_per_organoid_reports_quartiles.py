@@ -55,6 +55,26 @@ def test_synthetic_end_to_end():
                     'Circularity':.1+.02*oid,'Solidity':.5+.01*oid,'Eccentricity':.01+.03*oid}))
             pd.DataFrame(pixels).to_csv(folder/f'{channel}_ROI_pixels_FILTERED.csv',index=False)
             pd.DataFrame(metrics).to_csv(folder/f'{channel}_kept_ROI_metrics.csv',index=False)
+            stage07 = analysis/'07_nuclear_colocalization'/f'{channel}_vs_Hoechst'/'analysis.h5'
+            stage07.parent.mkdir(parents=True, exist_ok=True)
+            if channel == 'PV':
+                nuclei = [1000 + max(1, oid - 10) for oid in range(1, 21)]
+            else:
+                nuclei = [1000 + oid for oid in range(1, 21)]
+            stage07_mapping = pd.DataFrame({
+                'CellID': range(1, 21),
+                'A_ObjectID': range(1, 21),
+                'B_ObjectID': nuclei,
+            })
+            stage07_meta = {'objects': {'object_a_name': channel, 'object_b_name': 'Hoechst'},
+                            'matching': {'threshold_percent': 50}}
+            with h5py.File(stage07, 'w') as h:
+                h.create_dataset('metadata/json', data=np.bytes_(json.dumps(stage07_meta)))
+                h.create_dataset('images/object_a_original', data=image)
+                h.create_dataset('images/object_b_original', data=image)
+                h.create_dataset('tables/cell_id_mapping', data=np.frombuffer(stage07_mapping.to_csv(index=False).encode(), dtype='uint8'))
+                stage07_matching = stage07_mapping[['A_ObjectID','B_ObjectID']]
+                h.create_dataset('tables/stable_matching', data=np.frombuffer(stage07_matching.to_csv(index=False).encode(), dtype='uint8'))
         h5p=analysis/'08_marker_colocalization'/'LHX6_vs_PV'/'analysis.h5'
         h5p.parent.mkdir(parents=True)
         ap=[];bp=[]
@@ -69,13 +89,27 @@ def test_synthetic_end_to_end():
             dict(A_ObjectID=3,B_ObjectID=13,A_Percent_Inside_B=66.67,B_Percent_Inside_A=66.67,Shared_Area=6),
         ])
         matching=overlaps.iloc[:2].copy()
-        meta={'objects':{'object_a_name':'LHX6','object_b_name':'PV'},'matching':{'threshold_percent':50}}
+        meta={'objects':{'object_a_name':'LHX6','object_b_name':'PV'},'matching':{'threshold_percent':50},
+              'analysis_variant':'stage08_unconstrained_marker_marker'}
+        pair_mapping = pd.DataFrame([
+            {'PairID':'S08_LHX6_PV_P000001','A_ObjectID':1,'B_ObjectID':11,
+             'A_Original_ROI_ObjectID':1,'B_Original_ROI_ObjectID':11,
+             'A_Stage07_Source_CellID':1,'B_Stage07_Source_CellID':11,
+             'A_Canonical_Nuclear_ObjectID':1001,'B_Canonical_Nuclear_ObjectID':1001,
+             'Same_Nucleus':'YES','Final_Stable_Match':True},
+            {'PairID':'S08_LHX6_PV_P000002','A_ObjectID':2,'B_ObjectID':12,
+             'A_Original_ROI_ObjectID':2,'B_Original_ROI_ObjectID':12,
+             'A_Stage07_Source_CellID':2,'B_Stage07_Source_CellID':12,
+             'A_Canonical_Nuclear_ObjectID':1002,'B_Canonical_Nuclear_ObjectID':1002,
+             'Same_Nucleus':'YES','Final_Stable_Match':True},
+        ])
         with h5py.File(h5p,'w') as h:
             h.create_dataset('metadata/json',data=np.bytes_(json.dumps(meta)))
             h.create_dataset('images/object_a_original',data=image)
             h.create_dataset('images/object_b_original',data=image*2)
             for key,frame in {'object_a_pixels':pd.DataFrame(ap),'object_b_pixels':pd.DataFrame(bp),'stable_matching':matching,'overlap_results':overlaps}.items():
                 h.create_dataset('tables/'+key,data=np.frombuffer(frame.to_csv(index=False).encode(),dtype='uint8'))
+            h.create_dataset('tables/pair_id_mapping', data=np.frombuffer(pair_mapping.to_csv(index=False).encode(), dtype='uint8'))
         stage09=analysis/'09_marker_colocalization_nucleus_constrained'/'LHX6_vs_PV'/'analysis.h5'
         stage09.parent.mkdir(parents=True)
         shutil.copy2(h5p,stage09)
@@ -83,14 +117,19 @@ def test_synthetic_end_to_end():
         with h5py.File(stage09,'r+') as h:
             del h['metadata/json']
             h.create_dataset('metadata/json',data=np.bytes_(json.dumps(constrained_meta)))
+            del h['tables/pair_id_mapping']
+            stage09_mapping = pair_mapping.copy()
+            stage09_mapping['PairID'] = ['S09_LHX6_PV_P000001', 'S09_LHX6_PV_P000002']
+            h.create_dataset('tables/pair_id_mapping', data=np.frombuffer(stage09_mapping.to_csv(index=False).encode(), dtype='uint8'))
         assert h5p in mod.colocalization_files(analysis,'unconstrained')
         assert stage09 not in mod.colocalization_files(analysis,'unconstrained')
         assert stage09 in mod.colocalization_files(analysis,'nucleus-constrained')
         assert h5p not in mod.colocalization_files(analysis,'nucleus-constrained')
-        constrained_pair=mod.load_pair(stage09)
+        identities = mod.load_stage07_identities(analysis)
+        constrained_pair=mod.load_pair(stage09, identities)
         assert constrained_pair.variant=='nucleus_constrained_marker_marker'
-        assert '[NUCLEUS-CONSTRAINED]' in constrained_pair.name
-        p=mod.load_pair(h5p)
+        assert 'STAGE 09' in constrained_pair.name and 'NUCLEUS-CONSTRAINED' in constrained_pair.name
+        p=mod.load_pair(h5p, identities)
         assert len(p.matching)==2
         intens=mod.intensity_rows(p,0,'151-2')
         assert len(intens)==2 and (intens['overlap_area_pixels']==6).all()
@@ -102,25 +141,33 @@ def test_synthetic_end_to_end():
         assert [pack['quartile'] for pack in q] == [1,2,3,4]
         assert all(pack['count'] == 2 for pack in q)
         assert [int(pack['examples'][0]['row']['ObjectID']) for pack in q] == [1,3,5,7]
+        many = mod.quartile_examples(
+            pd.DataFrame([{'ObjectID': i, 'Area_um2': i} for i in range(1, 81)]),
+            'Area_um2', ['ObjectID'], max_examples=10,
+        )
+        assert [len(pack['examples']) for pack in many] == [10, 10, 10, 10]
+        assert sum(len(pack['examples']) for pack in many) == 40
         # Genuine final stable matched pair example (exclude unmatched 3/13).
         # ROI area/intensities and plots refer to the same A/B identifiers.
         pdf=root/'test_synthetic_report.pdf'
         with PdfPages(pdf) as out:
             mod.whole_page(out,analysis,[])
-            rows=mod.roi_quartile_pages(out,analysis,'LHX6',['integrated_intensity'],{1,2},0,'151-3',[])
+            rows=mod.roi_quartile_pages(out,analysis,'LHX6',['integrated_intensity'],{1,2},0,'151-3',[], identities['LHX6'])
             vals = mod.matched_pair_quartile_pages(out, p, 0, '151-3', examples_per_quartile=10)
         assert len(rows)==2
         assert len(vals)==2 and set(vals['A_ObjectID'])=={1,2}
         assert set(vals['B_ObjectID'])=={11,12}
-        import fitz
-        doc=fitz.open(pdf)
-        txt='\n'.join(page.get_text() for page in doc)
-        assert doc.page_count >= 3
+        from pypdf import PdfReader
+        doc=PdfReader(pdf)
+        txt='\n'.join(page.extract_text() or '' for page in doc.pages)
+        assert len(doc.pages) >= 3
         assert 'final stable-matched' in txt.lower() or 'FINAL STABLE MATCH' in txt
         assert 'Integrated fluorescence' in txt
         assert 'ROI #1' in txt or 'ROI #2' in txt
+        assert 'Stage-07 CellID' in txt
+        assert 'PairID S08_LHX6_PV_P000001' in txt
+        assert 'SAME NUCLEUS: YES' in txt
         assert 'Q1' in txt and 'Q2' in txt
-        doc.close()
         # Integration: invoke CLI main() with a small stub for upstream field
         # selection while keeping the real TIFF/ROI/HDF5 readers and PDF writer.
         stub = root / 'plot_igf_exp17_ventral_with_gfp_plots.py'
@@ -151,10 +198,17 @@ def test_synthetic_end_to_end():
         finally:
             mod.HERE = orig_here
         assert code == 0
-        produced = root/'reports'/'151-3'/'Exp17_151-3_Set3_DAPI_GFP_LHX6_PV_Field_1_organoid_report_quartiles.pdf'
+        produced = root/'reports'/'151-3'/'Exp17_151-3_Set3_DAPI_GFP_LHX6_PV_Field_1_organoid_report_cellid_both.pdf'
         assert produced.is_file() and produced.stat().st_size>10000
-        intensity_csv = root/'reports'/'151-3'/'Exp17_151-3_Set3_DAPI_GFP_LHX6_PV_Field_1_displayed_stable_matched_pair_quartiles.csv'
-        assert len(pd.read_csv(intensity_csv)) == 2 and set(pd.read_csv(intensity_csv)['A_ObjectID'])=={1,2}
+        intensity_csv = root/'reports'/'151-3'/'Exp17_151-3_Set3_DAPI_GFP_LHX6_PV_Field_1_displayed_stable_matched_pair_quartiles_cellid_both.csv'
+        displayed = pd.read_csv(intensity_csv)
+        assert len(displayed) == 4 and set(displayed['A_ObjectID'])=={1,2}
+        assert set(displayed.PairID) == {'S08_LHX6_PV_P000001','S08_LHX6_PV_P000002','S09_LHX6_PV_P000001','S09_LHX6_PV_P000002'}
+        all_stage08 = root/'reports'/'151-3'/'Exp17_151-3_Set3_DAPI_GFP_LHX6_PV_Field_1_all_stage08_final_pair_nuclear_identity.csv'
+        assert len(pd.read_csv(all_stage08)) == 2
+        identity_summary = pd.read_csv(root/'reports'/'151-3'/'Exp17_151-3_Set3_DAPI_GFP_LHX6_PV_Field_1_stage08_stage09_nuclear_identity_summary.csv')
+        assert set(identity_summary.Stage) == {8, 9}
+        assert set(identity_summary.Common_Final_Pairs) == {2}
         assert (root/'reports'/'report_manifest.csv').is_file()
         # The Stage-09 variant is independently selected, clearly named, and
         # cannot overwrite the default Stage-08 report or exemplar CSV.

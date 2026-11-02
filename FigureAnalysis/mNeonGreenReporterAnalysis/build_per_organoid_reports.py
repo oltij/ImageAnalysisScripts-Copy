@@ -67,6 +67,14 @@ def to_pairs(df: pd.DataFrame, label: str) -> dict[int, np.ndarray]:
     return pixels
 
 
+def xy_fingerprint(xy: np.ndarray) -> tuple[tuple[int, int], ...]:
+    points = np.asarray(xy, dtype=np.int64)
+    if not len(points):
+        return tuple()
+    order = np.lexsort((points[:, 0], points[:, 1]))
+    return tuple(map(tuple, points[order]))
+
+
 def check_pixels(groups: dict[int, np.ndarray], shape: tuple[int, int], label: str) -> None:
     h, w = shape
     for object_id, xy in groups.items():
@@ -218,6 +226,41 @@ def resolve_roi_files(analysis: Path, channel: str) -> tuple[Path, Path] | None:
     return None
 
 
+def load_stage07_identities(analysis: Path) -> dict[str, dict[int, dict]]:
+    """Return marker ObjectID -> Stage-07 CellID/canonical nucleus provenance."""
+    identities: dict[str, dict[int, dict]] = {}
+    for path in sorted((analysis / "07_nuclear_colocalization").glob("*/analysis.h5")):
+        with h5py.File(path, "r") as h5:
+            meta = json.loads(h5["metadata/json"][()].decode())
+            marker = meta["objects"]["object_a_name"]
+            mapping = read_table(h5, "cell_id_mapping")
+            source_pixels = (
+                to_pairs(read_table(h5, "object_a_pixels"), f"{path} Stage-07 marker pixels")
+                if "tables/object_a_pixels" in h5 else {}
+            )
+        required = {"CellID", "A_ObjectID", "B_ObjectID"}
+        if not required.issubset(mapping.columns):
+            raise ValueError(f"{path}: Stage-07 mapping missing {sorted(required - set(mapping.columns))}")
+        if marker in identities:
+            raise ValueError(f"Multiple Stage-07 identity sources found for {marker}")
+        marker_rows = {}
+        for row in mapping.itertuples(index=False):
+            original = int(row.A_ObjectID)
+            if original in marker_rows:
+                raise ValueError(f"{path}: duplicate original marker ROI {original}")
+            marker_rows[original] = {
+                "Stage07_CellID": int(row.CellID),
+                "Original_ROI_ObjectID": original,
+                "Canonical_Hoechst_Nuclear_ObjectID": int(row.B_ObjectID),
+                "Stage07_Source_H5": str(path),
+                "Coordinate_Fingerprint": (
+                    xy_fingerprint(source_pixels[original]) if original in source_pixels else None
+                ),
+            }
+        identities[marker] = marker_rows
+    return identities
+
+
 def quartile_examples(frame: pd.DataFrame, metric: str, id_columns: list[str],
                       max_examples: int = 10) -> list[dict]:
     """Return up to max_examples real records from each equal-count quartile.
@@ -281,7 +324,7 @@ def roi_crop_rgba(image: np.ndarray, xy: np.ndarray, limits: tuple[float,float],
 
 def roi_quartile_pages(pdf: PdfPages, analysis: Path, channel: str, metric_keys: list[str],
                        allowed_ids: set[int], field_index: int, sample: str,
-                       provenance: list[str], *, examples_per_quartile: int = 10,
+                       provenance: list[str], identities: dict[int, dict] | None = None, *, examples_per_quartile: int = 10,
                        rows_per_page: int = 5) -> list[dict]:
     """Display up to N exemplar ROIs per quartile, with each row fully traceable.
 
@@ -350,6 +393,18 @@ def roi_quartile_pages(pdf: PdfPages, analysis: Path, channel: str, metric_keys:
                         ax.axis('off')
                     chosen = example['row']
                     oid = int(chosen['ObjectID']); xy = groups[oid]
+                    identity = (identities or {}).get(oid)
+                    if identity is None:
+                        raise ValueError(
+                            f"{channel} ROI {oid} lacks authoritative Stage-07 CellID/nuclear provenance"
+                        )
+                    if (
+                        identity.get("Coordinate_Fingerprint") is not None
+                        and xy_fingerprint(xy) != identity["Coordinate_Fingerprint"]
+                    ):
+                        raise ValueError(
+                            f"{channel} ROI {oid} pixels do not match its Stage-07 source coordinates"
+                        )
                     x, y = float(xy[:, 0].mean()), float(xy[:, 1].mean())
                     axloc.imshow(thumb_rgb, interpolation='nearest'); axloc.scatter([x/skip], [y/skip], s=120, marker='o', facecolors='none', edgecolors='#00bfff', linewidths=2.0)
                     axloc.set_title(f'Field locator', fontsize=9)
@@ -364,6 +419,7 @@ def roi_quartile_pages(pdf: PdfPages, analysis: Path, channel: str, metric_keys:
                               "Eccentricity": chosen.get('Eccentricity', float('nan'))}
                     lines = [
                         f'Q{q} · ROI #{oid} · example {page_start + ridx + 1} of {len(examples)} displayed ({example["quartile_size"]} total in quartile)',
+                        f'Stage-07 CellID: {identity["Stage07_CellID"]}    Original marker ROI ObjectID: {identity["Original_ROI_ObjectID"]}    Canonical Hoechst nuclear ObjectID: {identity["Canonical_Hoechst_Nuclear_ObjectID"]}',
                         f'Rank metric: {display_name} = {float(chosen[col]):.5g}    Quartile range: {qrange[0]:.5g}–{qrange[1]:.5g}',
                         f'Area: {float(values["Area (µm²)"]):.5g} µm²    Mean fluorescence: {values["Mean intensity (native)"]:.5g}    Integrated fluorescence Σ: {values["Integrated intensity (native sum)"]:.6g}',
                         f'Circularity: {float(values["Circularity"]):.4g}    Solidity: {float(values["Solidity"]):.4g}    Eccentricity: {float(values["Eccentricity"]):.4g}',
@@ -373,6 +429,10 @@ def roi_quartile_pages(pdf: PdfPages, analysis: Path, channel: str, metric_keys:
                     output.append({"field_index": field_index, "sample": sample, "channel": channel, "quartile": f'Q{q}',
                                    "rank_metric": col, "rank_value": float(chosen[col]), "quartile_n": qcount,
                                    "quartile_range_min": qrange[0], "quartile_range_max": qrange[1], "ROI_ObjectID": oid,
+                                   "Stage07_CellID": identity["Stage07_CellID"],
+                                   "Original_ROI_ObjectID": identity["Original_ROI_ObjectID"],
+                                   "Canonical_Hoechst_Nuclear_ObjectID": identity["Canonical_Hoechst_Nuclear_ObjectID"],
+                                   "Stage07_Source_H5": identity["Stage07_Source_H5"],
                                    "display_order_within_quartile": page_start + ridx + 1, "displayed_examples_in_quartile": len(examples),
                                    "roi_pixel_count": len(xy), "Area_um2": values["Area (µm²)"],
                                    "mean_native_intensity": values["Mean intensity (native)"],
@@ -396,12 +456,13 @@ class PairData:
     b_pixels: dict[int, np.ndarray]
     matching: pd.DataFrame
     overlaps: pd.DataFrame
+    pair_mapping: pd.DataFrame
     threshold: float
     source: Path
     variant: str
 
 
-def load_pair(path: Path) -> PairData:
+def load_pair(path: Path, identities: dict[str, dict[int, dict]] | None = None) -> PairData:
     with h5py.File(path, "r") as h5:
         meta = json.loads(h5["metadata/json"][()].decode())
         a = meta["objects"]["object_a_name"]
@@ -412,6 +473,10 @@ def load_pair(path: Path) -> PairData:
         bb = to_pairs(read_table(h5, "object_b_pixels"), f"{b} H5")
         matching = read_table(h5, "stable_matching")
         overlaps = read_table(h5, "overlap_results")
+        pair_mapping = (
+            read_table(h5, "pair_id_mapping")
+            if "tables/pair_id_mapping" in h5 else pd.DataFrame()
+        )
     if ia.shape != ib.shape or ia.ndim != 2:
         raise ValueError(f"{path}: incompatible image shapes {ia.shape}, {ib.shape}")
     check_pixels(aa, ia.shape, a)
@@ -421,17 +486,76 @@ def load_pair(path: Path) -> PairData:
         raise ValueError(f"{path}: missing A_ObjectID/B_ObjectID in matching or overlap table")
     variant = meta.get("analysis_variant", "unconstrained")
     display_name = (
-        f"{a} vs {b} [NUCLEUS-CONSTRAINED]"
+        f"{a} vs {b} [STAGE 09 · NUCLEUS-CONSTRAINED]"
         if variant == "nucleus_constrained_marker_marker"
-        else f"{a} vs {b}"
+        else f"{a} vs {b} [STAGE 08 · UNCONSTRAINED]"
+        if variant == "stage08_unconstrained_marker_marker"
+        else f"{a} vs {b} [STAGE 07 · MARKER-NUCLEAR]"
     )
-    return PairData(display_name, a, b, ia, ib, aa, bb, matching, overlaps,
+    if variant in {"stage08_unconstrained_marker_marker", "nucleus_constrained_marker_marker"}:
+        stage = 9 if variant == "nucleus_constrained_marker_marker" else 8
+        if pair_mapping.empty and not matching.empty:
+            identity_sources = identities or {}
+            if a not in identity_sources or b not in identity_sources:
+                raise ValueError(f"{path}: missing Stage-07 identities needed for pair provenance")
+            rows = []
+            overlap_lookup = overlaps.set_index(["A_ObjectID", "B_ObjectID"])
+            def resolve_identity(marker: str, coordinates: np.ndarray) -> dict:
+                fingerprint = xy_fingerprint(coordinates)
+                candidates = [
+                    record for record in identity_sources[marker].values()
+                    if record.get("Coordinate_Fingerprint") == fingerprint
+                ]
+                if len(candidates) != 1:
+                    raise ValueError(
+                        f"{path}: exact Stage-07 coordinate identity for {marker} resolved to {len(candidates)} objects"
+                    )
+                return candidates[0]
+            for sequence, row in enumerate(
+                matching.sort_values(["A_ObjectID", "B_ObjectID"], kind="mergesort").itertuples(index=False), 1
+            ):
+                aid, bid = int(row.A_ObjectID), int(row.B_ObjectID)
+                ai = resolve_identity(a, aa[aid])
+                bi = resolve_identity(b, bb[bid])
+                overlap = overlap_lookup.loc[(aid, bid)]
+                same = "YES" if ai["Canonical_Hoechst_Nuclear_ObjectID"] == bi["Canonical_Hoechst_Nuclear_ObjectID"] else "NO"
+                rows.append({
+                    "PairID": (
+                        f"S{stage:02d}_"
+                        f"{re.sub(r'[^A-Za-z0-9]+', '_', a).strip('_')}_"
+                        f"{re.sub(r'[^A-Za-z0-9]+', '_', b).strip('_')}_P{sequence:06d}"
+                    ),
+                    "A_ObjectID": aid, "B_ObjectID": bid,
+                    "A_Original_ROI_ObjectID": ai["Original_ROI_ObjectID"],
+                    "B_Original_ROI_ObjectID": bi["Original_ROI_ObjectID"],
+                    "A_Stage07_Source_CellID": ai["Stage07_CellID"],
+                    "B_Stage07_Source_CellID": bi["Stage07_CellID"],
+                    "A_Canonical_Nuclear_ObjectID": ai["Canonical_Hoechst_Nuclear_ObjectID"],
+                    "B_Canonical_Nuclear_ObjectID": bi["Canonical_Hoechst_Nuclear_ObjectID"],
+                    "Same_Nucleus": same,
+                    "A_Percent_Inside_B": float(overlap.A_Percent_Inside_B),
+                    "B_Percent_Inside_A": float(overlap.B_Percent_Inside_A),
+                    "Final_Stable_Match": True,
+                })
+            pair_mapping = pd.DataFrame(rows)
+        if len(pair_mapping):
+            expected = set(zip(matching.A_ObjectID.astype(int), matching.B_ObjectID.astype(int)))
+            actual = set(zip(pair_mapping.A_ObjectID.astype(int), pair_mapping.B_ObjectID.astype(int)))
+            if expected != actual or pair_mapping.PairID.duplicated().any():
+                raise ValueError(f"{path}: pair_id_mapping is inconsistent with final matches")
+            if stage == 9 and not pair_mapping.Same_Nucleus.astype(str).eq("YES").all():
+                raise ValueError(f"{path}: Stage-09 final pair is not verified SAME NUCLEUS: YES")
+    return PairData(display_name, a, b, ia, ib, aa, bb, matching, overlaps, pair_mapping,
                     float(meta["matching"]["threshold_percent"]), path, variant)
 
 
 def colocalization_files(analysis: Path, marker_pair_variant: str) -> list[Path]:
-    nuclear = sorted((analysis / "07_nuclear_colocalization").glob("*/analysis.h5"))
-    if marker_pair_variant == "unconstrained":
+    if marker_pair_variant == "both":
+        marker = sorted((analysis / "08_marker_colocalization").glob("*/analysis.h5"))
+        marker += sorted(
+            (analysis / "09_marker_colocalization_nucleus_constrained").glob("*/analysis.h5")
+        )
+    elif marker_pair_variant == "unconstrained":
         marker = sorted((analysis / "08_marker_colocalization").glob("*/analysis.h5"))
     elif marker_pair_variant == "nucleus-constrained":
         marker = sorted(
@@ -443,7 +567,7 @@ def colocalization_files(analysis: Path, marker_pair_variant: str) -> list[Path]
             )
     else:
         raise ValueError(f"Unknown marker-pair variant: {marker_pair_variant}")
-    return nuclear + marker
+    return marker
 
 
 def intensity_rows(pair: PairData, field_index: int, sample: str, selected_matches: pd.DataFrame | None = None) -> pd.DataFrame:
@@ -495,6 +619,20 @@ def matched_pair_quartile_pages(pdf: PdfPages, pair: PairData, field_index: int,
     merged = pair.matching[["A_ObjectID", "B_ObjectID"]].merge(
         pair.overlaps[["A_ObjectID", "B_ObjectID", "A_Percent_Inside_B", "B_Percent_Inside_A"]],
         on=["A_ObjectID", "B_ObjectID"], how='left', validate='one_to_one')
+    if not pair.pair_mapping.empty:
+        provenance_columns = [
+            column for column in pair.pair_mapping.columns
+            if column not in {
+                "A_Percent_Inside_B", "B_Percent_Inside_A", "Shared_Area",
+                "Final_Stable_Match",
+            }
+        ]
+        merged = merged.merge(
+            pair.pair_mapping[provenance_columns],
+            on=["A_ObjectID", "B_ObjectID"], how="left", validate="one_to_one",
+        )
+        if merged["PairID"].isna().any():
+            raise ValueError(f"{pair.source}: a final pair is missing PairID provenance")
     if merged['A_Percent_Inside_B'].isna().any() or merged['B_Percent_Inside_A'].isna().any():
         raise ValueError(f'{pair.source}: final matches missing overlap metrics')
     quartiles = quartile_examples(merged, 'A_Percent_Inside_B', ["A_ObjectID", "B_ObjectID"], max_examples=examples_per_quartile)
@@ -546,20 +684,123 @@ def matched_pair_quartile_pages(pdf: PdfPages, pair: PairData, field_index: int,
                 for ax, img, title in ((ax_b, rb, f'{pair.b} ROI #{bid}'), (ax_a, ra, f'{pair.a} ROI #{aid}'), (ax_c, composite, 'A red · B green')):
                     ax.imshow(img, interpolation='nearest'); ax.set_title(title, fontsize=8.8, pad=3)
                 lines = [
-                    f'Q{q} · pair {page_start + ridx + 1} of {len(rows)} displayed · FINAL STABLE MATCH',
+                    f'Q{q} · pair {page_start + ridx + 1} of {len(rows)} displayed · FINAL STABLE MATCH'
+                    + (f' · PairID {getattr(r, "PairID")}' if hasattr(r, "PairID") else ''),
                     f'{pair.a} #{aid} ↔ {pair.b} #{bid}    {pair.a} in {pair.b}: {float(r.A_percent_inside_B):.2f}%    {pair.b} in {pair.a}: {float(r.B_percent_inside_A):.2f}%',
+                    (
+                        f'{pair.a} Stage-07 CellID {getattr(r, "A_Stage07_Source_CellID")} · original ROI {getattr(r, "A_Original_ROI_ObjectID")} · nucleus {getattr(r, "A_Canonical_Nuclear_ObjectID")} | '
+                        f'{pair.b} Stage-07 CellID {getattr(r, "B_Stage07_Source_CellID")} · original ROI {getattr(r, "B_Original_ROI_ObjectID")} · nucleus {getattr(r, "B_Canonical_Nuclear_ObjectID")} | '
+                        f'SAME NUCLEUS: {getattr(r, "Same_Nucleus")}'
+                        if hasattr(r, "PairID") else
+                        'Stage-07 marker–nuclear pair; its shared CellID remains stored in the source HDF5.'
+                    ),
                     f'Quartile size: {int(r.quartile_n)}    overlap range in Q{q}: {float(r.quartile_range_min):.2f}–{float(r.quartile_range_max):.2f}%',
                     f'{pair.a}: ROI pixels {int(r.A_roi_area_pixels)}    mean {float(r.A_roi_mean_intensity_native):.5g}    Σ {float(r.A_roi_integrated_intensity_native_sum):.6g}',
                     f'{pair.b}: ROI pixels {int(r.B_roi_area_pixels)}    mean {float(r.B_roi_mean_intensity_native):.5g}    Σ {float(r.B_roi_integrated_intensity_native_sum):.6g}',
                     f'Overlap pixels: {int(r.overlap_area_pixels)}    overlap Σ: {pair.a}={float(r.A_overlap_integrated_intensity_native_sum):.5g}    {pair.b}={float(r.B_overlap_integrated_intensity_native_sum):.5g}',
                 ]
                 ax_t.text(.01, .99, lines[0], weight='bold', fontsize=10, va='top')
-                ax_t.text(.01, .80, "\n".join(lines[1:]), fontsize=9.2, va='top', linespacing=1.4)
+                ax_t.text(.01, .80, "\n".join(lines[1:]), fontsize=8.7, va='top', linespacing=1.3)
             fig.text(.042, .965, f'{pair.name} · Q{q} final stable-matched exemplars', fontsize=16.2, weight='bold')
             fig.text(.042, .928, f'Sample {sample} | Field {field_index} | Matched pairs: {len(pair.matching)} | A-proposing threshold: {pair.threshold:g}% | displaying {len(chunk)} of {len(rows)} requested exemplars (page {page_no}/{page_total})', fontsize=10)
             fig.text(.042, .03, 'Each row is one exact final matched pair only: left = B fluorescence, center-left = A fluorescence, center-right = composite, right = values for these same A/B ROI IDs. Blue outline = B ROI; red outline = A ROI. Intensities are native uncorrected fluorescence.', fontsize=8.6)
             pdf.savefig(fig, bbox_inches='tight'); plt.close(fig)
     return measured
+
+
+def collect_marker_pair_identity_tables(
+    pair_files: list[Path], identities: dict[str, dict[int, dict]]
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Collect every final Stage-08/09 pair and a field-level comparison."""
+    frames = []
+    for path in pair_files:
+        stage = 8 if "08_marker_colocalization" in path.parts else (
+            9 if "09_marker_colocalization_nucleus_constrained" in path.parts else None
+        )
+        if stage is None:
+            continue
+        mapping = None
+        with h5py.File(path, "r") as h5:
+            if "tables/pair_id_mapping" in h5:
+                mapping = read_table(h5, "pair_id_mapping")
+                meta = json.loads(h5["metadata/json"][()].decode())
+                a = meta["objects"]["object_a_name"]
+                b = meta["objects"]["object_b_name"]
+        if mapping is None:
+            fallback = load_pair(path, identities)
+            mapping, a, b = fallback.pair_mapping, fallback.a, fallback.b
+        mapping = mapping.copy()
+        mapping["Stage"] = stage
+        mapping["Marker_Pair"] = f"{a}_vs_{b}"
+        mapping["Source_H5"] = str(path)
+        frames.append(mapping)
+    all_pairs = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    summary_rows = []
+    for stage in (8, 9):
+        subset = all_pairs[all_pairs.Stage.eq(stage)] if len(all_pairs) else pd.DataFrame()
+        total = len(subset)
+        same = int(subset.Same_Nucleus.astype(str).eq("YES").sum()) if total else 0
+        different = int(subset.Same_Nucleus.astype(str).eq("NO").sum()) if total else 0
+        unresolved = int(subset.Same_Nucleus.astype(str).eq("UNRESOLVED").sum()) if total else 0
+        unique_nuclei = int(pd.to_numeric(
+            subset.loc[subset.Same_Nucleus.astype(str).eq("YES"), "A_Canonical_Nuclear_ObjectID"],
+            errors="coerce",
+        ).dropna().nunique()) if total else 0
+        summary_rows.append({
+            "Stage": stage,
+            "Analysis_Variant": "stage08_unconstrained" if stage == 8 else "stage09_nucleus_constrained",
+            "Total_Final_Pairs": total,
+            "Same_Nucleus_Count": same,
+            "Different_Nucleus_Count": different,
+            "Unresolved_Nucleus_Count": unresolved,
+            "Same_Nucleus_Percent": 100.0 * same / total if total else 0.0,
+            "Different_Nucleus_Percent": 100.0 * different / total if total else 0.0,
+            "Unresolved_Nucleus_Percent": 100.0 * unresolved / total if total else 0.0,
+            "Unique_Shared_Nuclei": unique_nuclei,
+        })
+    summary = pd.DataFrame(summary_rows)
+    if len(all_pairs):
+        keys = {
+            stage: set(
+                zip(
+                    all_pairs.loc[all_pairs.Stage.eq(stage), "Marker_Pair"].astype(str),
+                    all_pairs.loc[all_pairs.Stage.eq(stage), "A_ObjectID"].astype(int),
+                    all_pairs.loc[all_pairs.Stage.eq(stage), "B_ObjectID"].astype(int),
+                )
+            )
+            for stage in (8, 9)
+        }
+    else:
+        keys = {8: set(), 9: set()}
+    summary["Common_Final_Pairs"] = len(keys[8] & keys[9])
+    summary["Stage08_Only_Final_Pairs"] = len(keys[8] - keys[9])
+    summary["Stage09_Only_Final_Pairs"] = len(keys[9] - keys[8])
+    return all_pairs, summary
+
+
+def marker_pair_comparison_page(pdf: PdfPages, summary: pd.DataFrame) -> None:
+    rows = {int(row.Stage): row for row in summary.itertuples(index=False)}
+    paragraphs = [
+        "Stage 08 is unconstrained marker-mask spatial matching. Stage 09 independently reruns stable matching after requiring both marker ROIs to map to the same canonical Hoechst nucleus. Nuclear coexpression remains distinct from direct marker-mask overlap.",
+    ]
+    for stage in (8, 9):
+        row = rows[stage]
+        paragraphs.append(
+            f"Stage {stage}: {row.Total_Final_Pairs} final pairs; SAME NUCLEUS YES={row.Same_Nucleus_Count} "
+            f"({row.Same_Nucleus_Percent:.2f}%), NO={row.Different_Nucleus_Count} "
+            f"({row.Different_Nucleus_Percent:.2f}%), UNRESOLVED={row.Unresolved_Nucleus_Count} "
+            f"({row.Unresolved_Nucleus_Percent:.2f}%); unique shared nuclei={row.Unique_Shared_Nuclei}."
+        )
+    first = rows[8]
+    paragraphs.append(
+        f"Exact final-pair tracking: common to both={first.Common_Final_Pairs}; "
+        f"Stage-08 only={first.Stage08_Only_Final_Pairs}; "
+        f"Stage-09 only={first.Stage09_Only_Final_Pairs}. Tracking uses marker pair plus exact A/B ObjectIDs, not PairID sequence equality."
+    )
+    paragraphs.append(
+        "The complete Stage-08 identity CSV includes every final pair. Quartile CSVs include only the exemplars actually displayed in this PDF."
+    )
+    note_page(pdf, "Stage 08 vs Stage 09 · nuclear-identity summary", paragraphs)
 
 
 def stable_ids_by_channel(pair_files: list[Path]) -> dict[str,set[int]]:
@@ -656,9 +897,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument('--all-summary-plots',action='store_true',help='Include all 20 comparison figures instead of 8 core figures')
     ap.add_argument(
         '--marker-pair-variant',
-        choices=('unconstrained', 'nucleus-constrained'),
-        default='unconstrained',
-        help='Marker-pair result tree to report; variants are written to separate output files',
+        choices=('both', 'unconstrained', 'nucleus-constrained'),
+        default='both',
+        help='Marker-pair result tree to report; default combines Stage 08 and Stage 09 in a distinct report',
     )
     ap.add_argument('--compact',action='store_true',help='Backward-compatible alias; concise quartiles are now the default')
     ap.add_argument('--append-existing-qc-pdfs',action='store_true',help='Unsupported in quartile-only reports to avoid unmatched/below-threshold pages')
@@ -686,21 +927,33 @@ def main(argv: list[str] | None = None) -> int:
     chosen=chosen.sort_values('index')
     if args.max_fields:chosen=chosen.head(args.max_fields)
     if chosen.empty:raise ValueError('No eligible Experiment 17 ventral fields match requested filters')
-    variant_suffix = '_nucleus_constrained' if args.marker_pair_variant == 'nucleus-constrained' else ''
+    variant_suffix = (
+        '_cellid_both' if args.marker_pair_variant == 'both'
+        else '_nucleus_constrained' if args.marker_pair_variant == 'nucleus-constrained'
+        else ''
+    )
     out=(args.out or original/f'mentor_field_plots/per_organoid_reports_quartiles{variant_suffix}').expanduser().resolve()
     LOGGER.info('Creating %d field reports (final stable matched, Q1..Q4)',len(chosen))
     report_records=[]
     for entry in chosen.to_dict('records'):
         name=re.sub(r'[^A-Za-z0-9_.-]+','_',Path(entry['source_field']).name).strip('_')
-        folder=out/entry['sample'];dest=folder/f'{name}_organoid_report_quartiles{variant_suffix}.pdf'
+        folder=out/entry['sample']
+        dest = (
+            folder/f'{name}_organoid_report_cellid_both.pdf'
+            if args.marker_pair_variant == 'both'
+            else folder/f'{name}_organoid_report_quartiles{variant_suffix}.pdf'
+        )
         if dest.exists() and not args.overwrite:
             LOGGER.info('Existing report, skipping: %s (use --overwrite)',dest)
             continue
         folder.mkdir(parents=True,exist_ok=True)
         analysis=Path(entry['output_dir'])
         files=colocalization_files(analysis, args.marker_pair_variant)
+        identities = load_stage07_identities(analysis)
+        all_pair_identities, pair_identity_summary = collect_marker_pair_identity_tables(files, identities)
         # Read each pair's stored final match identities. No new matching occurs.
-        stable=stable_ids_by_channel(files)
+        stage07_files = sorted((analysis / "07_nuclear_colocalization").glob("*/analysis.h5"))
+        stable=stable_ids_by_channel(stage07_files + files)
         single_rows=[];matched_rows=[];provenance=[]
         partial=dest.with_name(dest.stem+'.incomplete.pdf')
         try:
@@ -708,7 +961,8 @@ def main(argv: list[str] | None = None) -> int:
                 note_page(pdf,f'Exp 17 · {entry["sample"]} · Field {entry["index"]}',[
                     f'Source: {entry["source_field"]}',
                     f'{entry["cell_line"]} | {entry["condition"]} | {entry["anti_gfp_status"]} | Ventral organoid',
-                    f'Marker-pair report variant: {args.marker_pair_variant.upper()}. Stage-07 marker–nuclear pages retain their original definition.',
+                    f'Marker-pair report variant: {args.marker_pair_variant.upper()}. Stage-07 marker–nuclear identity assignments retain their original definition.',
+                    'By default this combined report contains separate Stage-08 unconstrained and Stage-09 nucleus-constrained quartile sections. Quartiles and exemplar selection are computed independently for each variant.',
                     'This PDF represents ONE microscope field, not all fields in its sample-section.',
                     'Final stable matches ONLY: standalone ROI examples must participate in at least one final upstream stable match. Colocalization examples are final one-to-one matched pairs only. No unmatched or below-threshold displays.',
                     'A row of images, IDs and numeric measurements always refers to exactly the SAME selected ROI or A/B PAIR. Each rank quartile Q1–Q4 displays up to the requested number of real exemplars, chosen to span that quartile.',
@@ -719,12 +973,13 @@ def main(argv: list[str] | None = None) -> int:
                     f'Available colocalization analysis files: {len(files)}. Each pair with final matches contributes quartile pages, split automatically when needed.'
                 ])
                 whole_page(pdf,analysis,provenance)
+                marker_pair_comparison_page(pdf, pair_identity_summary)
                 if not args.skip_single_rois:
                     for channel in ('GFP','LHX6','PV'):
-                        single_rows.extend(roi_quartile_pages(pdf, analysis, channel, keys, stable.get(channel, set()), int(entry['index']), entry['sample'], provenance, examples_per_quartile=args.max_examples))
+                        single_rows.extend(roi_quartile_pages(pdf, analysis, channel, keys, stable.get(channel, set()), int(entry['index']), entry['sample'], provenance, identities.get(channel), examples_per_quartile=args.max_examples))
                 if not args.skip_colocalization:
                     for pairfile in files:
-                        pair=load_pair(pairfile)
+                        pair=load_pair(pairfile, identities)
                         provenance.append('Pair HDF5: '+str(pair.source))
                         if not pair.matching.empty:
                             records = matched_pair_quartile_pages(pdf, pair, int(entry['index']), entry['sample'], examples_per_quartile=args.max_examples)
@@ -746,6 +1001,7 @@ def main(argv: list[str] | None = None) -> int:
                     'Colocalization displays: each HORIZONTAL ROW has its own exact A ID and B ID; blue boundary = B ROI, red boundary = A ROI. Composite fluorescence A=red/B=green. Percentages are directional ROI pixel-area overlap (A in B vs B in A), copied from upstream HDF5. Stable matching is not rerun.',
                     'Integrated intensity (Σ) = direct sum of the original stored fluorescence pixels within the FULL matched ROI. Overlap Σ = direct sum of those pixel values at the intersection. No background correction or cross-condition gain normalization. Do not interpret fluorescence units as molecules.',
                     'The CSV exports contain ONLY the displayed quartile exemplars, including the same ROI IDs and quartile labels shown inside this PDF. Summary charts still use the complete previously verified field metrics and highlight THIS field in black. If a quartile contains fewer than the requested examples, all available members are shown.',
+                    'Group-level comparison plots are the existing reporter-analysis metrics. They remain based on their established Stage-07/unconstrained inputs and are not silently redefined as Stage-09 measurements.',
                 ]+provenance[:12])
             partial.replace(dest)
         except Exception:
@@ -753,14 +1009,23 @@ def main(argv: list[str] | None = None) -> int:
             raise
         solo_csv=folder/f'{name}_displayed_single_roi_quartiles{variant_suffix}.csv'
         matched_csv=folder/f'{name}_displayed_stable_matched_pair_quartiles{variant_suffix}.csv'
-        pd.DataFrame(single_rows, columns=['field_index', 'sample', 'channel', 'quartile', 'rank_metric', 'rank_value', 'quartile_n', 'quartile_range_min', 'quartile_range_max', 'display_order_within_quartile', 'displayed_examples_in_quartile', 'ROI_ObjectID', 'roi_pixel_count', 'Area_um2', 'mean_native_intensity', 'integrated_native_intensity_sum', 'Circularity', 'Solidity', 'Eccentricity']).to_csv(solo_csv, index=False)
+        pd.DataFrame(single_rows, columns=['field_index', 'sample', 'channel', 'quartile', 'rank_metric', 'rank_value', 'quartile_n', 'quartile_range_min', 'quartile_range_max', 'display_order_within_quartile', 'displayed_examples_in_quartile', 'ROI_ObjectID', 'Stage07_CellID', 'Original_ROI_ObjectID', 'Canonical_Hoechst_Nuclear_ObjectID', 'Stage07_Source_H5', 'roi_pixel_count', 'Area_um2', 'mean_native_intensity', 'integrated_native_intensity_sum', 'Circularity', 'Solidity', 'Eccentricity']).to_csv(solo_csv, index=False)
         matched_frame = pd.concat(matched_rows, ignore_index=True) if matched_rows else pd.DataFrame(
             columns=['field_index','sample','pair','A_ObjectID','B_ObjectID','quartile','display_order_within_quartile','displayed_examples_in_quartile','A_roi_integrated_intensity_native_sum','B_roi_integrated_intensity_native_sum','A_overlap_integrated_intensity_native_sum','B_overlap_integrated_intensity_native_sum']
         )
         matched_frame.to_csv(matched_csv,index=False)
+        stage08_all_csv = folder/f'{name}_all_stage08_final_pair_nuclear_identity.csv'
+        identity_summary_csv = folder/f'{name}_stage08_stage09_nuclear_identity_summary.csv'
+        stage08_all = (
+            all_pair_identities[all_pair_identities.Stage.eq(8)].copy()
+            if len(all_pair_identities) else pd.DataFrame()
+        )
+        stage08_all.to_csv(stage08_all_csv, index=False)
+        pair_identity_summary.to_csv(identity_summary_csv, index=False)
         report_records.append({'index':entry['index'],'sample':entry['sample'],'source_field':entry['source_field'],
             'marker_pair_variant':args.marker_pair_variant,
             'pdf':str(dest),'single_roi_displayed_csv':str(solo_csv),'stable_matched_displayed_csv':str(matched_csv),
+            'all_stage08_final_pair_identity_csv':str(stage08_all_csv),'stage08_stage09_identity_summary_csv':str(identity_summary_csv),
             'n_pair_hdf5':len(files),'displayed_single_roi':len(single_rows),'displayed_final_pairs':len(matched_frame)})
         LOGGER.info('Saved %s | standalone ROI exemplars=%d | final matched pair exemplars=%d',dest,len(single_rows),len(matched_frame))
     if report_records:

@@ -4,15 +4,15 @@
 
 ## Core design
 
-One PDF **per microscope field**, grouped by sample-section (`151-3/`, etc.). It is a read-only visualization/export layer. It does not rerun or modify alignment, CellProfiler, ROI filtering, stable matching, or prior analyses. New PDFs go to `mentor_field_plots/per_organoid_reports_quartiles/` and use `_organoid_report_quartiles.pdf` filenames. To regenerate any existing short PDF, pass `--overwrite`.
+One PDF **per microscope field**, grouped by sample-section (`151-3/`, etc.). It is a read-only visualization/export layer. It does not rerun or modify alignment, CellProfiler, ROI filtering, stable matching, or prior analyses.
 
-Marker-pair pages use the original unconstrained Stage-08 tree by default.
-Use `--marker-pair-variant nucleus-constrained` to build a separate report
-from Stage 09. That mode labels every marker pair `NUCLEUS-CONSTRAINED`, uses a
-separate default output directory, and adds `_nucleus_constrained` to every PDF
-and displayed-exemplar CSV name. It never mixes Stage-08 and Stage-09
-marker-pair HDF5 files. Stage-07 marker-nuclear pages remain available in both
-report variants and retain their original meaning.
+The default is a new combined report containing independent Stage-08
+unconstrained and Stage-09 nucleus-constrained sections. It is written under
+`mentor_field_plots/per_organoid_reports_quartiles_cellid_both/` with an
+`_organoid_report_cellid_both.pdf` filename, so legacy reports are not
+overwritten. Quartiles are computed separately for the two variants. Use
+`--marker-pair-variant unconstrained` or `nucleus-constrained` for the legacy
+single-variant layouts. To regenerate an existing report, pass `--overwrite`.
 
 ### What changed in this replacement
 
@@ -32,7 +32,9 @@ This version is designed to be much easier to read:
 3. **Standalone final-stable-matched ROI quartiles**: for each selected channel × ranking metric, pages are organized by **Q1–Q4**. Each displayed row is one exact ROI and includes:
    - full-field location marker,
    - fluorescence crop,
-   - exact ROI ID,
+   - Stage-07 marker-specific CellID,
+   - original marker ROI ObjectID,
+   - canonical Hoechst nuclear ObjectID,
    - quartile membership,
    - ranking metric value,
    - area,
@@ -45,12 +47,15 @@ This version is designed to be much easier to read:
    - Object B fluorescence with blue outline,
    - Object A fluorescence with red outline,
    - A-red / B-green composite,
-   - exact A/B ROI IDs,
+   - deterministic Stage-08 or Stage-09 PairID,
+   - both marker-specific Stage-07 CellIDs and original ROI ObjectIDs,
+   - both canonical nuclear ObjectIDs and `SAME NUCLEUS: YES/NO/UNRESOLVED`,
    - directional overlap percentages,
    - full-ROI mean and integrated intensity for both ROIs,
    - overlap-only integrated intensities for both channels.
-5. **Eight key IGF comparison charts** (PV/LHX6 and GFP) showing **the exact current field outlined in black**; use `--all-summary-plots` for all 20 charts.
-6. **Methods, provenance and legends**.
+5. **Stage-08 vs Stage-09 summary** using every final pair, including same-, different-, and unresolved-nucleus counts and unique shared nuclei.
+6. **Eight key IGF comparison charts** (PV/LHX6 and GFP) showing **the exact current field outlined in black**; use `--all-summary-plots` for all 20 charts. These retain the established Stage-07/unconstrained field metrics and are not silently redefined as Stage-09 values.
+7. **Methods, provenance and legends**.
 
 Unmatched, best-partial-overlap, below-threshold, before/after and exhaustive pair-intensity pages are no longer assembled into the new PDF. `--append-existing-qc-pdfs` is deliberately rejected because it defeats the final-only scope.
 
@@ -94,7 +99,7 @@ FigureAnalysis/mNeonGreenReporterAnalysis/
   tests/test_per_organoid_reports_quartiles.py
 ```
 
-Python 3.10+ packages: `numpy`, `pandas`, `scipy`, `tifffile`, `matplotlib`, `h5py`. Running the synthetic test additionally requires `pytest` and PyMuPDF (imported as `fitz`). Run from the existing `ims-mosaic` environment on Great Lakes.
+Python 3.10+ packages: `numpy`, `pandas`, `scipy`, `tifffile`, `matplotlib`, `h5py`. Running the synthetic test additionally requires `pytest` and `pypdf`. Run from the existing `ims-mosaic` environment on Great Lakes.
 
 ### Pilot: one real field
 
@@ -115,7 +120,7 @@ python "$REPO/FigureAnalysis/mNeonGreenReporterAnalysis/build_per_organoid_repor
   --h1-workspace "$W1" --remaining-workspace "$W2" --max-examples 10
 ```
 
-### Separate nucleus-constrained marker-pair reports
+### Optional single-variant reports
 
 ```bash
 python "$REPO/FigureAnalysis/mNeonGreenReporterAnalysis/build_per_organoid_reports.py" \
@@ -126,13 +131,13 @@ python "$REPO/FigureAnalysis/mNeonGreenReporterAnalysis/build_per_organoid_repor
 This requires
 `analysis/09_marker_colocalization_nucleus_constrained/*/analysis.h5` for each
 field being reported and fails explicitly if no Stage-09 marker-pair result is
-present. The default remains `--marker-pair-variant unconstrained`.
+present. The default is `--marker-pair-variant both`.
 
 Useful options:
 
 - `--max-examples 10` (default): up to 10 displayed exemplars per quartile.
-- `--marker-pair-variant unconstrained|nucleus-constrained`: select one
-  marker-pair result tree; default is unconstrained.
+- `--marker-pair-variant both|unconstrained|nucleus-constrained`: combine both
+  variants by default or explicitly select one result tree.
 - `--roi-metrics integrated_intensity,area`: adds standalone quartile pages for additional ranking metrics.
 - `--all-summary-plots`: include all 20 summary charts.
 - `--only-field "Field_1"`
@@ -147,10 +152,12 @@ Useful options:
 
 ## CSV outputs and identity matching
 
-For every PDF, two CSV files are saved in the same sample-section folder:
+For every PDF, four CSV files are saved in the same sample-section folder:
 
-- `<field>_displayed_single_roi_quartiles.csv`: one row for each exact standalone ROI shown, including quartile label, display order, ROI ID and measurements.
-- `<field>_displayed_stable_matched_pair_quartiles.csv`: one row for each exact A/B pair shown, including quartile label, display order, directional overlaps and fluorescence totals.
+- `<field>_displayed_single_roi_quartiles*.csv`: one row for each exact standalone ROI shown, including Stage-07 CellID, original ROI, canonical nucleus, quartile, and measurements.
+- `<field>_displayed_stable_matched_pair_quartiles*.csv`: one row for each exact A/B pair shown, including PairID, both marker identities, same-nucleus status, directional overlaps, and fluorescence totals.
+- `<field>_all_stage08_final_pair_nuclear_identity.csv`: **all** final Stage-08 pairs, not merely displayed exemplars, separated into same-, different-, and unresolved-nucleus identities.
+- `<field>_stage08_stage09_nuclear_identity_summary.csv`: field-level comparison counts, percentages, and unique shared-nucleus counts.
 
 Only **displayed** objects occur in either CSV. The report folder also contains `report_manifest.csv` for the generated field reports.
 

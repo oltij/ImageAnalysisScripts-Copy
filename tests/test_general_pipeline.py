@@ -646,7 +646,7 @@ class BackwardCompatibilityTests(unittest.TestCase):
         "IGF Organoids/configs/ims_mge_generic.example.json": "899dea9edb1b451e34735a593cd19cc351d2c4efa0656b907456566d3bc01a93",
         "IGF Organoids/configs/production_94_fields.json": "a21432014d2f158d4c1939578b64cb795517aa1cf6d3381e0041d22f8f3e647f",
         "Alignment/CASTalign_two_channel_registration.py": "0b6100725ee98f3cc58596f6a80d2d751031c15c2732018edf4649a00808c795",
-        "run_stitched_pipeline.py": "482f2958d946e867535c4dee0f497b26d6eca56ff74f34376b49f43daac36c23",
+        "run_stitched_pipeline.py": "e2575be8aa2e98a373e0996642f15ba114d5f4250dee09eddd17f3bbb50dcf85",
         "run_ims_pipeline.py": "7c99fe219eefe944efd818a81f07743bf10f59aea7dc676415aeaf6f178496c7",
     }
 

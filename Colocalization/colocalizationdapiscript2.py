@@ -180,6 +180,10 @@ def load_results(results_file: Path):
         cell_id_mapping = dataframe_from_h5(
             h5, "cell_id_mapping"
         )
+        pair_id_mapping = (
+            dataframe_from_h5(h5, "pair_id_mapping")
+            if "tables/pair_id_mapping" in h5 else pd.DataFrame()
+        )
         unmatched_df = dataframe_from_h5(
             h5, "unmatched_object_a"
         )
@@ -204,6 +208,7 @@ def load_results(results_file: Path):
             "eligible_df": eligible_df,
             "matching_df": matching_df,
             "cell_id_mapping": cell_id_mapping,
+            "pair_id_mapping": pair_id_mapping,
             "unmatched_df": unmatched_df,
             "filtering_stage_df": filtering_stage_df,
             "filtered_a": filtered_a,
@@ -231,6 +236,7 @@ overlap_df = data["overlap_df"]
 eligible_df = data["eligible_df"]
 matching_df = data["matching_df"]
 cell_id_mapping = data["cell_id_mapping"]
+pair_id_mapping = data["pair_id_mapping"]
 unmatched_df = data["unmatched_df"]
 filtering_stage_df = data["filtering_stage_df"]
 
@@ -239,6 +245,7 @@ OBJECT_B_NAME = metadata["objects"]["object_b_name"]
 THRESHOLD = metadata["matching"]["threshold"]
 ANALYSIS_VARIANT = metadata.get("analysis_variant", "unconstrained_marker_marker")
 IS_NUCLEUS_CONSTRAINED = ANALYSIS_VARIANT == "nucleus_constrained_marker_marker"
+IS_STAGE08_MARKER_PAIR = ANALYSIS_VARIANT == "stage08_unconstrained_marker_marker"
 
 PIXEL_SIZE_X_UM = metadata["pixel_size_um"]["x"]
 PIXEL_SIZE_Y_UM = metadata["pixel_size_um"]["y"]
@@ -546,6 +553,18 @@ if len(matching_df) > 0:
                     "CellID"
                 ].iloc[0]
             )
+            pair_id = None
+            if not pair_id_mapping.empty:
+                selected_pair_id = pair_id_mapping.loc[
+                    pair_id_mapping["A_ObjectID"].astype(int).eq(a_id)
+                    & pair_id_mapping["B_ObjectID"].astype(int).eq(b_id),
+                    "PairID",
+                ]
+                if len(selected_pair_id) != 1:
+                    raise ValueError(
+                        f"Expected one PairID for final pair {(a_id, b_id)}, found {len(selected_pair_id)}"
+                    )
+                pair_id = str(selected_pair_id.iloc[0])
 
             a_pixels = a_pixel_groups[a_id]
             b_pixels = b_pixel_groups[b_id]
@@ -796,9 +815,9 @@ if len(matching_df) > 0:
             ax_combined.text(
                 center_x,
                 center_y,
-                f"Cell {cell_id}",
+                pair_id if pair_id is not None else f"Cell {cell_id}",
                 color="white",
-                fontsize=8,
+                fontsize=6.5 if pair_id is not None else 8,
                 fontweight="bold",
                 ha="center",
                 va="center",
@@ -820,8 +839,10 @@ if len(matching_df) > 0:
 
         fig.suptitle(
             (
-                "NUCLEUS-CONSTRAINED: "
-                if IS_NUCLEUS_CONSTRAINED else ""
+                "STAGE 09 · NUCLEUS-CONSTRAINED: "
+                if IS_NUCLEUS_CONSTRAINED else
+                "STAGE 08 · UNCONSTRAINED: "
+                if IS_STAGE08_MARKER_PAIR else ""
             )
             + f"Random {OBJECT_A_NAME}-{OBJECT_B_NAME} Matched Cells",
             fontsize=18,

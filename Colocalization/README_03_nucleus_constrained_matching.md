@@ -95,6 +95,10 @@ The original output remains at:
 
 ```text
 analysis/08_marker_colocalization/<A>_vs_<B>/
+  analysis.h5
+  pair_id_mapping.csv
+  stage08_final_pair_nuclear_identity.csv
+  stage08_shared_nuclei_summary.csv
 ```
 
 The additional output is separate:
@@ -102,12 +106,16 @@ The additional output is separate:
 ```text
 analysis/09_marker_colocalization_nucleus_constrained/<A>_vs_<B>/
   analysis.h5
+  pair_id_mapping.csv
+  stage09_final_pair_nuclear_identity.csv
+  stage09_shared_nuclei_summary.csv
   nuclear_constraint_pair_audit.csv
   visualizations/
   comparison_to_unconstrained/
     matching_variant_comparison.csv
     matching_variant_pair_details.csv
     discordant_unconstrained_final_pairs.csv
+    pair_id_crosswalk_stage08_vs_stage09.csv
     matching_variant_comparison.pdf
     matching_variant_comparison.png
 ```
@@ -118,6 +126,16 @@ filtered pixels, summaries, and filtering counts. It additionally stores the
 two verified nuclear-assignment tables and `nuclear_constraint_audit`.
 Metadata records both Stage-07 source HDF5 paths and the identity-validation
 policy.
+
+Both marker-pair variants store `tables/pair_id_mapping` and export it as CSV.
+Final pairs are sorted by `(A_ObjectID, B_ObjectID)` and receive deterministic,
+variant-scoped identifiers such as `S08_LHX6_PV_P000017` and
+`S09_LHX6_PV_P000011`. A PairID is not a CellID. Stage 08 resolves nuclear
+identity only after its historical matching is complete, so this audit layer
+cannot alter Stage-08 eligibility or stable matching. Its row-level and
+field-summary CSVs include all final pairs, including verified same-nucleus,
+different-nucleus, and unresolved assignments. Every Stage-09 final PairID is
+validated as `Same_Nucleus = YES`.
 
 The audit has one row per spatially overlapping candidate and records original
 A/B object IDs, Stage-07 source CellIDs, canonical nuclear ObjectIDs, mapping
@@ -132,7 +150,9 @@ threshold-passing candidates, different-nucleus and unresolved exclusions,
 constraint-passing candidates, final counts in both variants, common and
 variant-only final pairs, and the fraction of unconstrained final pairs whose
 resolved nuclear identities disagree. Pair-detail and discordance CSVs retain
-the exact provenance identifiers.
+the exact provenance identifiers. The PairID crosswalk links common exact
+`(A_ObjectID, B_ObjectID)` pairs and records Stage-08-only, Stage-09-only, and
+unresolved-identity cases; it never joins variants by pair sequence number.
 
 Visualization filenames retain their established names inside the Stage-09
 parent directory. Titles explicitly say `NUCLEUS-CONSTRAINED`. The nuclear
@@ -141,22 +161,23 @@ the same Stage-07 all-nuclei classification and are not Stage-09 match counts.
 
 ## Per-organoid reports
 
-The existing reporter remains unconstrained by default. Request the separate
-Stage-09 report explicitly:
+The reporter now combines separate Stage-08 and Stage-09 quartile sections by
+default:
 
 ```bash
 python FigureAnalysis/mNeonGreenReporterAnalysis/build_per_organoid_reports.py \
   --h1-workspace "$W1" \
   --remaining-workspace "$W2" \
-  --marker-pair-variant nucleus-constrained \
+  --marker-pair-variant both \
   --max-examples 10
 ```
 
-It reads marker-pair HDF5 files only from the Stage-09 tree, labels the pair as
-`NUCLEUS-CONSTRAINED`, and adds `_nucleus_constrained` to report and CSV names.
-The unconstrained files and output directory are not overwritten. The
-established maximum of 10 displayed exemplars per quartile and ROI-level
-traceability are unchanged.
+The combined report has distinct filenames/directories, computes quartiles
+independently by variant, and shows PairIDs, both Stage-07 CellIDs, original
+ROI IDs, canonical nuclear IDs, and same-nucleus status beside every displayed
+pair. `--marker-pair-variant unconstrained` and `nucleus-constrained` remain
+available for single-variant reports. The established maximum of 10 displayed
+exemplars per quartile and ROI-level traceability are unchanged.
 
 ## Focused validation
 

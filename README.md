@@ -2377,7 +2377,9 @@ source assignments must name the same canonical nuclear ObjectID. Run-local
 CellIDs and coincident numeric ROI values are never used as proof of identity.
 
 Stage 09 stores a candidate-level identity/eligibility audit and writes direct
-Stage-08-versus-Stage-09 CSV/PDF/PNG comparisons. Because matching is rerun on
+Stage-08-versus-Stage-09 CSV/PDF/PNG comparisons. Both variants also export
+deterministic, variant-scoped PairIDs, complete final-pair nuclear provenance,
+and a PairID crosswalk. Because matching is rerun on
 the reduced graph, a constrained final pair need not be a subset of the
 unconstrained final matching. The all-nuclei A+/B+ classification remains the
 separate Stage-07-derived result described below.
